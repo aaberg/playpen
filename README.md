@@ -32,9 +32,10 @@ mkdir -p ~/bin && cp bin/omp-sbx ~/bin/ && chmod +x ~/bin/omp-sbx
 mkdir -p ~/.local/share/omp-home
 
 # 4. API keys: one NAME=value per line (format: keys.conf.example)
-mkdir -p ~/.config/omp-sbx
+mkdir -p ~/.config/omp-sbx && chmod 700 ~/.config/omp-sbx
 echo 'MISTRAL_API_KEY=op://Private/Mistral API Key/credential' \
   > ~/.config/omp-sbx/keys.conf
+chmod 600 ~/.config/omp-sbx/keys.conf
 ```
 
 ## Daily use
@@ -44,10 +45,13 @@ cd ~/Development/myproject
 omp-sbx omp-rust    # Rust project
 omp-sbx omp-jvm     # JVM/Kotlin project
 omp-sbx             # no flavor: plain base
+omp-sbx --host-engine omp-rust   # trusted project: + host Podman socket
 ```
 
-Inside the container, omp runs in yolo mode safely: its $HOME is
-`~/.local/share/omp-home` on your disk - expendable by design.
+Inside the container, omp runs in yolo mode: its $HOME is
+`~/.local/share/omp-home` on your disk - expendable by design. The sandbox
+boundary is the container's mounts - by default just the workspace and
+the agent home.
 
 ## Notes
 
@@ -68,11 +72,20 @@ Inside the container, omp runs in yolo mode safely: its $HOME is
   `NAME=value` per line; a value is a literal or an `op://` reference. The
   launcher resolves references with the 1Password CLI (vault must be
   unlocked - expect one biometric prompt per launch) and passes every key
-  to the container via `--env-file`. Resolved values exist only in a 0600
-  tmpfs file for the duration of the launch; literal values are plaintext
-  in the config file, so prefer `op://`.
-- Testcontainers: the host podman socket is mounted and `CONTAINER_HOST` /
-  `DOCKER_HOST` point at it - a conscious tradeoff: gives the container real
-  host Podman.
+  to the container via a 0600 temp `--env-file`, deleted on exit. For the
+  container's lifetime each key is readable by anything inside the
+  container and visible to anyone with engine access (`podman inspect`
+  shows env) - 1Password protects the credential at rest, not in use, so
+  inject only what a project needs: `--keys <file>` swaps in a
+  per-project key set. Literal values are plaintext in the config file -
+  keep it mode 0600 (the launcher tightens it if looser) and prefer
+  `op://`.
+- Host Podman access (Testcontainers etc.) is opt-in per launch:
+  `omp-sbx --host-engine <flavor>` or `OMP_SBX_HOST_ENGINE=1` (per-project
+  via direnv). It mounts the host podman socket and points `CONTAINER_HOST`
+  / `DOCKER_HOST` at it. Without it the container gets no engine. With it
+  the isolation boundary is your host user: code inside can create sibling
+  containers that mount anything you can read and inspect every container
+  on the engine - treat it as a trusted-project switch.
 - The agent's git identity: set it once inside the persistent home
   (`git config --global user.name/user.email`) or mount a minimal gitconfig.
