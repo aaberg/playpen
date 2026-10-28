@@ -6,7 +6,7 @@ FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
 
 # Core toolchain. Order: least- to most-often-changing.
 RUN dnf -y install \
-      git zsh \
+      git \
       nodejs npm \
       gcc gcc-c++ make \
       python3 pipx \
@@ -23,24 +23,24 @@ RUN curl -fsSL https://bun.com/install | bash \
     && bun --version
 
 # Non-root agent user with its own throwaway home
-RUN useradd -m -s /bin/zsh agent
+RUN useradd -m -s /bin/bash agent
 
 # Oh My Pi, installed for the agent user
 RUN npm install -g @oh-my-pi/pi-coding-agent \
     && chown -R agent:agent /home/agent
 
-# Quiet default zshrc (also applied to newly created homes via /etc/skel)
+# Minimal agent-home bashrc (also applied to newly created homes via /etc/skel)
 RUN printf '%s\n' \
-      '# Minimal agent-home zshrc' \
-      'autoload -Uz compinit && compinit' \
-      'HISTFILE=~/.zsh_history' \
+      '# Minimal agent-home bashrc' \
+      'HISTFILE=~/.bash_history' \
       'HISTSIZE=10000' \
-      'SAVEHIST=10000' \
-      'setopt SHARE_HISTORY HIST_IGNORE_DUPS' \
+      'HISTFILESIZE=10000' \
+      'HISTCONTROL=ignoredups' \
+      'shopt -s histappend checkwinsize' \
       "alias ls='ls --color=auto'" \
-      > /etc/skel/.zshrc \
-    && cp /etc/skel/.zshrc /home/agent/.zshrc \
-    && chown agent:agent /home/agent/.zshrc
+      > /etc/skel/.bashrc \
+    && cp /etc/skel/.bashrc /home/agent/.bashrc \
+    && chown agent:agent /home/agent/.bashrc
 
 USER agent
 
@@ -48,4 +48,4 @@ USER agent
 RUN git config --global init.defaultBranch main
 
 WORKDIR /workspace
-CMD ["/bin/zsh"]
+CMD ["/bin/bash"]
