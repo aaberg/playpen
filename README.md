@@ -7,7 +7,7 @@ per-language flavor images (`playpen-rust`, `playpen-jvm`, ...).
 ## Layout
 
 ```
-base/                playpen-base: Fedora, git, zsh, node, bun, omp, agent user
+base/                playpen-base: Fedora, git, bash, node, bun, omp, agent user
 flavors/rust/        playpen-rust: rustup toolchain, sccache, native build deps
 flavors/jvm/         playpen-jvm: JDK LTS, Maven, standalone Kotlin compiler
 bin/playpen          launcher
