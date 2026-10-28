@@ -1,8 +1,13 @@
 # playpen
 
-Personal agent sandbox: Oh My Pi in a rootless Podman container.
+Personal agent sandbox: Oh My Pi in a rootless container (Podman by
+default, Docker supported).
 Two layers: `playpen-base` (language-neutral base, rebuild rarely) + thin
 per-language flavor images (`playpen-rust`, `playpen-jvm`, ...).
+
+Engine selection: the launcher uses podman unless `PLAYPEN_ENGINE=docker`
+(or podman is absent and docker is found). Builds go through the same
+engine: `make all ENGINE=docker`.
 
 ## Layout
 
@@ -16,7 +21,7 @@ Makefile             build helpers
 ```
 
 Adding a flavor: one directory under `flavors/` with a Containerfile
-(`FROM localhost/playpen-base:latest`), one rule in the Makefile, tag it
+(`FROM playpen-base:latest`), one rule in the Makefile, tag it
 `playpen-<flavor>`. The launcher needs no changes: `playpen playpen-<flavor>`.
 
 ## Setup
@@ -45,7 +50,7 @@ cd ~/Development/myproject
 playpen playpen-rust    # Rust project
 playpen playpen-jvm     # JVM/Kotlin project
 playpen                 # no flavor: plain base
-playpen --host-engine playpen-rust   # trusted project: + host Podman socket
+playpen --host-engine playpen-rust   # trusted project: + host engine socket
 ```
 
 Inside the container, omp runs in yolo mode: its $HOME is
@@ -55,17 +60,18 @@ the agent home.
 
 ## Notes
 
-- Fedora is pinned in `base/Containerfile` (`ARG FEDORA_VERSION`); bump it and
-  `make base` to move to a newer release.
-- Rust: `CARGO_HOME=/opt/agent-cargo`, mounted as the named podman volume
-  `playpen-cargo`, so the registry cache and `cargo install`-ed tools persist
-  across sessions. sccache is wired in via `RUSTC_WRAPPER`; its cache lives
+- The base image is `fedora-minimal` (`ARG FEDORA_VERSION` in
+  `base/Containerfile`); bump it and `make base` to move to a newer release.
+- Rust: `CARGO_HOME=/opt/agent-cargo`, mounted as the named volume
+  `playpen-cargo` (only for `playpen-rust`), so the registry cache and
+  `cargo install`-ed tools persist across sessions. sccache is wired in via `RUSTC_WRAPPER`; its cache lives
   under the persistent agent home, so clean rebuilds stay fast.
 - JVM: JDK 25 (LTS) via `java-25-openjdk-devel`; change `JDK_VERSION` in
   `flavors/jvm/Containerfile` for another line (e.g. 21). Gradle projects
   rely on their wrapper; Maven covers wrapper-less builds. Standalone
   `kotlinc` is for scripts and quick experiments.
-- `--userns=keep-id`: files the agent creates are owned by you on the host.
+- User mapping: podman `--userns=keep-id`; docker `--user $UID:$GID`. Either
+  way, files the agent creates are owned by you on the host.
 - `:Z` labels bind mounts for SELinux (Fedora); the named volume is labeled
   automatically.
 - API keys: `~/.config/playpen/keys.conf` (see `keys.conf.example`) - one

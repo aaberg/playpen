@@ -2,19 +2,27 @@
 # Language-neutral: OS, shell, git, node, and the omp coding agent.
 # Rebuild rarely (new tools / Fedora release): make base
 ARG FEDORA_VERSION=44
-FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
+FROM registry.fedoraproject.org/fedora-minimal:${FEDORA_VERSION}
 
 # Core toolchain. Order: least- to most-often-changing.
-RUN dnf -y install \
+# fedora-minimal ships microdnf and little else; bash, curl and shadow-utils
+# (useradd) are not part of the default image.
+RUN microdnf -y install \
+      bash \
+      coreutils \
+      curl \
+      findutils \
+      diffutils \
+      procps-ng \
+      shadow-utils \
       git \
       nodejs npm \
       gcc gcc-c++ make \
       python3 pipx \
       openssl-devel pkgconf-pkg-config \
-      procps-ng findutils diffutils \
       podman \
       sqlite \
-    && dnf clean all
+    && microdnf clean all
 
 # Bun, system-wide (script defaults to $HOME/.bun, which would vanish)
 RUN curl -fsSL https://bun.com/install | bash \

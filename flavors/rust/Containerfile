@@ -1,6 +1,6 @@
 # playpen-rust — Rust development on top of playpen-base
 # Build: make rust   (or: podman build -t playpen-rust flavors/rust)
-FROM localhost/playpen-base:latest
+FROM playpen-base:latest
 
 USER root
 
