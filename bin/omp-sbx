@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Launch omp inside the agent container.
+# Usage: omp-sbx [image]   (default: omp-base; omp-rust / omp-jvm for flavors)
+#
+# API keys come from ~/.config/omp-sbx/keys.conf: one NAME=value per line;
+# blank lines and #-comments are ignored. A value is either a literal or an
+# op:// reference, resolved with the 1Password CLI at launch. No keys file
+# means launching without keys; an unresolvable reference aborts the launch.
+set -euo pipefail
+
+IMAGE="${1:-omp-base}"
+KEYS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omp-sbx/keys.conf"
+
+ENV_ARGS=()
+if [[ -f "$KEYS_FILE" ]]; then
+  TMP_ENV="$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/omp-sbx-env.XXXXXX")"
+  trap 'rm -f "$TMP_ENV"' EXIT
+  chmod 600 "$TMP_ENV"
+  while IFS='=' read -r name value || [[ -n "${name:-}" ]]; do
+    name="${name//[[:space:]]/}"     # env var names hold no whitespace
+    [[ -z "$name" || "$name" == "#"* ]] && continue
+    value="${value:-}"               # a final line without newline leaves it unset
+    value="${value%$'\r'}"           # tolerate CRLF line endings
+    [[ -z "$value" ]] && continue
+    if [[ "$value" == op://* ]]; then
+      if ! value="$(op read "$value")"; then
+        echo "omp-sbx: could not resolve 1Password reference for $name" >&2
+        exit 1
+      fi
+    fi
+    printf '%s=%s\n' "$name" "$value" >> "$TMP_ENV"
+  done < "$KEYS_FILE"
+  if [[ -s "$TMP_ENV" ]]; then
+    ENV_ARGS+=(--env-file "$TMP_ENV")
+  fi
+else
+  echo "omp-sbx: $KEYS_FILE not found - launching without API keys" >&2
+fi
+
+podman run --rm -it \
+  --userns=keep-id \
+  --name "omp-agent-$$" \
+  -v "$PWD":/workspace:Z \
+  -v "${HOME}/.local/share/omp-home":/home/agent:Z \
+  -v omp-cargo:/opt/agent-cargo \
+  -v "/run/user/$(id -u)/podman/podman.sock:/run/podman/podman.sock:Z" \
+  -e CONTAINER_HOST=unix:///run/podman/podman.sock \
+  -e DOCKER_HOST=unix:///run/podman/podman.sock \
+  "${ENV_ARGS[@]}" \
+  "$IMAGE"

@@ -1,0 +1,28 @@
+# omp-jvm — JVM/Kotlin development on top of omp-base
+# Build: make jvm   (or: podman build -t omp-jvm flavors/jvm)
+FROM localhost/omp-base:latest
+
+USER root
+
+# JDK LTS + Maven. Gradle: rely on project wrappers — they pin their own
+# version and download it. Switch JDK line via JDK_VERSION (Fedora also
+# ships e.g. java-21-openjdk-devel).
+ARG JDK_VERSION=25
+RUN dnf -y install java-${JDK_VERSION}-openjdk-devel maven unzip \
+    && dnf clean all
+
+ENV JAVA_HOME=/usr/lib/jvm/java-${JDK_VERSION}-openjdk
+
+# Standalone Kotlin compiler for scripts, REPL and quick experiments —
+# Gradle projects use the Kotlin plugin's embedded compiler instead.
+ARG KOTLIN_VERSION=2.4.21
+RUN curl -fsSL -o /tmp/kotlin.zip \
+      "https://github.com/JetBrains/kotlin/releases/download/v${KOTLIN_VERSION}/kotlin-compiler-${KOTLIN_VERSION}.zip" \
+    && unzip -q /tmp/kotlin.zip -d /opt \
+    && chmod +x /opt/kotlinc/bin/* \
+    && rm -f /tmp/kotlin.zip
+
+ENV PATH="/opt/kotlinc/bin:${PATH}"
+
+USER agent
+WORKDIR /workspace

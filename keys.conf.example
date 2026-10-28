@@ -1,0 +1,11 @@
+# omp-sbx API keys
+#
+# Live file: ~/.config/omp-sbx/keys.conf
+# Format:   NAME=value - one per line (no spaces around '='). Blank lines
+#           and #-comments are allowed. The value is either:
+#             - a literal key (plaintext at rest - fine for dev keys)
+#             - an op:// reference, resolved via the 1Password CLI at launch
+#
+# MISTRAL_API_KEY=op://Private/Mistral API Key/credential
+# OPENAI_API_KEY=op://Private/OpenAI/skey
+# ANTHROPIC_API_KEY=literal-dev-key

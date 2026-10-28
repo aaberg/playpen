@@ -1,0 +1,52 @@
+# omp-rust — Rust development on top of omp-base
+# Build: make rust   (or: podman build -t omp-rust flavors/rust)
+FROM localhost/omp-base:latest
+
+USER root
+
+# Native build deps for common crates:
+# - clang-devel: libclang for bindgen-based -sys crates
+# - cmake: for cmake-built C/C++ crate deps
+# - git-lfs: clones LFS repos for real instead of pointer files
+# - libpq-devel: only for libpq-linked crates (diesel, postgres crate);
+#   sqlx and tokio-postgres are pure Rust
+# - ripgrep/fd via dnf: instant install instead of cargo compiling them
+RUN dnf -y install \
+      clang-devel \
+      cmake \
+      git-lfs \
+      libpq-devel \
+      ripgrep \
+      fd-find \
+    && dnf clean all
+
+# Rust via rustup, system-wide (survives agent-user home wipes)
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal \
+      --component rustfmt,clippy,rust-analyzer \
+    && mv /root/.cargo /usr/local/cargo \
+    && mv /root/.rustup /usr/local/rustup \
+    && echo 'export PATH="/usr/local/cargo/bin:$PATH"' > /etc/profile.d/cargo.sh \
+    && echo 'export RUSTUP_HOME=/usr/local/rustup' >> /etc/profile.d/cargo.sh
+
+# Toolchain shims live in /usr/local/cargo/bin; cargo-installed tools land in
+# $CARGO_HOME/bin — both must be on PATH or installs are invisible.
+ENV PATH="/opt/agent-cargo/bin:/usr/local/cargo/bin:${PATH}" \
+    RUSTUP_HOME=/usr/local/rustup
+
+# Cargo cache separate from the root-owned toolchain in /usr/local/cargo.
+# The launcher mounts the named podman volume `omp-cargo` here so the
+# registry cache and cargo-installed tools survive across sessions.
+ENV CARGO_HOME=/opt/agent-cargo
+RUN mkdir -p /opt/agent-cargo && chown 1000:1000 /opt/agent-cargo
+
+# sccache keeps clean rebuilds fast; cache dir sits under the persistent
+# mounted agent home. RUSTC_WRAPPER is set below, after this install.
+RUN cargo install sccache \
+    && chown -R 1000:1000 /opt/agent-cargo
+
+USER agent
+
+ENV SCCACHE_DIR=/home/agent/.cache/sccache \
+    RUSTC_WRAPPER=sccache
+
+WORKDIR /workspace
