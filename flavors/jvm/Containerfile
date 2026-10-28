@@ -1,6 +1,6 @@
 # playpen-jvm — JVM/Kotlin development on top of playpen-base
 # Build: make jvm   (or: podman build -t playpen-jvm flavors/jvm)
-FROM localhost/playpen-base:latest
+FROM playpen-base:latest
 
 USER root
 

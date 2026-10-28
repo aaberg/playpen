@@ -8,10 +8,16 @@
 # CLI at launch. No keys file means launching without keys; an unresolvable
 # reference aborts the launch.
 #
-# --host-engine (or PLAYPEN_HOST_ENGINE=1) mounts the host Podman socket:
-# the container can then drive the host engine (Testcontainers etc.), but
-# code inside can create sibling containers and read anything the host user
-# can read. Trusted projects only.
+# --host-engine (or PLAYPEN_HOST_ENGINE=1) mounts the host container engine
+# socket: the container can then drive the host engine (Testcontainers etc.),
+# but code inside can create sibling containers and read anything the host
+# user can read. Trusted projects only.
+#
+# Container engine: podman (default) or docker, selected with PLAYPEN_ENGINE
+# or auto-detected when podman is absent. Differences handled per engine:
+#   podman: --userns=keep-id, rootless socket at /run/user/$UID/podman.sock
+#   docker: --user $UID:$GID (no keep-id equivalent), rootless socket at
+#           ~/.docker/run/docker.sock, falling back to /var/run/docker.sock
 set -euo pipefail
 
 usage() {
@@ -41,6 +47,22 @@ done
 IMAGE="${IMAGE:-playpen-base}"
 if [[ "${PLAYPEN_HOST_ENGINE:-}" =~ ^(1|true|yes)$ ]]; then
   HOST_ENGINE=1
+fi
+
+# Engine selection: explicit PLAYPEN_ENGINE, else auto-detect.
+ENGINE="${PLAYPEN_ENGINE:-}"
+if [[ -z "$ENGINE" ]]; then
+  if command -v podman >/dev/null 2>&1; then
+    ENGINE=podman
+  elif command -v docker >/dev/null 2>&1; then
+    ENGINE=docker
+  else
+    echo "playpen: neither podman nor docker found in PATH" >&2
+    exit 1
+  fi
+elif [[ "$ENGINE" != podman && "$ENGINE" != docker ]]; then
+  echo "playpen: unknown engine: $ENGINE (expected podman or docker)" >&2
+  exit 1
 fi
 
 ENV_ARGS=()
@@ -80,16 +102,43 @@ fi
 
 ENGINE_ARGS=()
 if [[ "$HOST_ENGINE" -eq 1 ]]; then
-  if [[ ! -S "/run/user/$(id -u)/podman/podman.sock" ]]; then
-    echo "playpen: host podman socket not found - start it with: systemctl --user start podman.socket" >&2
-    exit 1
+  if [[ "$ENGINE" == podman ]]; then
+    HOST_SOCK="/run/user/$(id -u)/podman/podman.sock"
+    if [[ ! -S "$HOST_SOCK" ]]; then
+      echo "playpen: host podman socket not found - start it with: systemctl --user start podman.socket" >&2
+      exit 1
+    fi
+  else
+    HOST_SOCK="$HOME/.docker/run/docker.sock"
+    [[ -S "$HOST_SOCK" ]] || HOST_SOCK=/var/run/docker.sock
+    if [[ ! -S "$HOST_SOCK" ]]; then
+      echo "playpen: host docker socket not found - is the docker daemon running?" >&2
+      exit 1
+    fi
   fi
   echo "playpen: host engine access enabled - the boundary is your host user" >&2
   ENGINE_ARGS+=(
-    -v "/run/user/$(id -u)/podman/podman.sock:/run/podman/podman.sock:z"
-    -e CONTAINER_HOST=unix:///run/podman/podman.sock
-    -e DOCKER_HOST=unix:///run/podman/podman.sock
+    -v "$HOST_SOCK:/run/host-engine.sock"
+    -e DOCKER_HOST=unix:///run/host-engine.sock
   )
+  if [[ "$ENGINE" == podman ]]; then
+    ENGINE_ARGS+=(-e CONTAINER_HOST=unix:///run/host-engine.sock)
+  fi
+fi
+
+# Podman maps the agent to the invoking user via keep-id; docker has no
+# equivalent, so run as the invoking UID:GID directly.
+USERNS_ARGS=()
+if [[ "$ENGINE" == podman ]]; then
+  USERNS_ARGS+=(--userns=keep-id)
+else
+  USERNS_ARGS+=(--user "$(id -u):$(id -g)")
+fi
+
+# The cargo volume only exists for images that define /opt/agent-cargo.
+CARGO_ARGS=()
+if [[ "$IMAGE" == playpen-rust* ]]; then
+  CARGO_ARGS+=(-v playpen-cargo:/opt/agent-cargo)
 fi
 
 HOME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/playpen-home"
@@ -98,12 +147,12 @@ if [[ ! -d "$HOME_DIR" ]]; then
   echo "playpen: created $HOME_DIR" >&2
 fi
 
-podman run --rm -it \
-  --userns=keep-id \
+"$ENGINE" run --rm -it \
+  "${USERNS_ARGS[@]}" \
   --name "playpen-agent-$$" \
   -v "$PWD":/workspace:Z \
   -v "$HOME_DIR":/home/agent:Z \
-  -v playpen-cargo:/opt/agent-cargo \
+  "${CARGO_ARGS[@]}" \
   "${ENGINE_ARGS[@]}" \
   "${ENV_ARGS[@]}" \
   "$IMAGE"
