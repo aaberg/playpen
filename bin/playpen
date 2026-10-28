@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Launch omp inside the agent container.
-# Usage: playpen [--host-engine] [--keys FILE] [image]   (default: playpen-base)
+# Usage: playpen [--host-engine] [--keys FILE] [--shell] [image] [-- CMD ARGS...]
+#   (default image: playpen-base)
+#
+# The container command defaults to omp; --shell starts a bash instead, and
+# everything after `--` becomes the container command (`-- bash`,
+# `-- omp --version`). When the command exits the container is removed (--rm).
 #
 # API keys come from ~/.config/playpen/keys.conf (override with --keys):
 # one NAME=value per line; blank lines and #-comments are ignored. A value
@@ -21,19 +26,28 @@
 set -euo pipefail
 
 usage() {
-  echo 'usage: playpen [--host-engine] [--keys FILE] [image]'
+  echo 'usage: playpen [--host-engine] [--keys FILE] [--shell] [image] [-- CMD [ARGS...]]'
 }
 
 HOST_ENGINE=0
+SHELL_MODE=0
 KEYS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/playpen/keys.conf"
 KEYS_EXPLICIT=0
 IMAGE=
+COMMAND=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host-engine) HOST_ENGINE=1 ;;
+    --shell) SHELL_MODE=1 ;;
     --keys)
       [[ $# -ge 2 ]] || { echo "playpen: --keys needs a file argument" >&2; exit 1; }
       KEYS_FILE="$2"; KEYS_EXPLICIT=1; shift
+      ;;
+    --)
+      shift
+      [[ $# -ge 1 ]] || { echo "playpen: -- needs a command" >&2; exit 1; }
+      COMMAND=("$@")
+      break
       ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "playpen: unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -45,6 +59,17 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 IMAGE="${IMAGE:-playpen-base}"
+if [[ "$SHELL_MODE" -eq 1 && ${#COMMAND[@]} -gt 0 ]]; then
+  echo "playpen: --shell cannot be combined with a command after --" >&2
+  exit 1
+fi
+if [[ ${#COMMAND[@]} -eq 0 ]]; then
+  if [[ "$SHELL_MODE" -eq 1 ]]; then
+    COMMAND=(/bin/bash)
+  else
+    COMMAND=(omp)
+  fi
+fi
 if [[ "${PLAYPEN_HOST_ENGINE:-}" =~ ^(1|true|yes)$ ]]; then
   HOST_ENGINE=1
 fi
@@ -155,4 +180,5 @@ fi
   "${CARGO_ARGS[@]}" \
   "${ENGINE_ARGS[@]}" \
   "${ENV_ARGS[@]}" \
-  "$IMAGE"
+  "$IMAGE" \
+  "${COMMAND[@]}"

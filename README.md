@@ -51,7 +51,13 @@ playpen playpen-rust    # Rust project
 playpen playpen-jvm     # JVM/Kotlin project
 playpen                 # no flavor: plain base
 playpen --host-engine playpen-rust   # trusted project: + host engine socket
+playpen --shell playpen-rust         # bash prompt instead of omp
+playpen playpen-jvm -- omp --version # any other command inside
 ```
+
+The container command is omp (started in /workspace), so quitting omp ends
+the session and drops you back on the host - the container is removed.
+`--shell` (or `-- bash`) gives the old interactive-shell behavior.
 
 Inside the container, omp runs in yolo mode: its $HOME is
 `~/.local/share/playpen-home` on your disk - expendable by design. The sandbox
