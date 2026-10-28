@@ -92,11 +92,17 @@ if [[ "$HOST_ENGINE" -eq 1 ]]; then
   )
 fi
 
+HOME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/playpen-home"
+if [[ ! -d "$HOME_DIR" ]]; then
+  mkdir -p "$HOME_DIR"
+  echo "playpen: created $HOME_DIR" >&2
+fi
+
 podman run --rm -it \
   --userns=keep-id \
   --name "playpen-agent-$$" \
   -v "$PWD":/workspace:Z \
-  -v "${HOME}/.local/share/playpen-home":/home/agent:Z \
+  -v "$HOME_DIR":/home/agent:Z \
   -v playpen-cargo:/opt/agent-cargo \
   "${ENGINE_ARGS[@]}" \
   "${ENV_ARGS[@]}" \
