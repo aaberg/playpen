@@ -1,4 +1,4 @@
-# omp-base — personal base image for AI agent work
+# playpen-base — personal base image for AI agent work
 # Language-neutral: OS, shell, git, node, and the omp coding agent.
 # Rebuild rarely (new tools / Fedora release): make base
 ARG FEDORA_VERSION=44

@@ -1,62 +1,62 @@
 #!/usr/bin/env bash
 # Launch omp inside the agent container.
-# Usage: omp-sbx [--host-engine] [--keys FILE] [image]   (default: omp-base)
+# Usage: playpen [--host-engine] [--keys FILE] [image]   (default: playpen-base)
 #
-# API keys come from ~/.config/omp-sbx/keys.conf (override with --keys):
+# API keys come from ~/.config/playpen/keys.conf (override with --keys):
 # one NAME=value per line; blank lines and #-comments are ignored. A value
 # is either a literal or an op:// reference, resolved with the 1Password
 # CLI at launch. No keys file means launching without keys; an unresolvable
 # reference aborts the launch.
 #
-# --host-engine (or OMP_SBX_HOST_ENGINE=1) mounts the host Podman socket:
+# --host-engine (or PLAYPEN_HOST_ENGINE=1) mounts the host Podman socket:
 # the container can then drive the host engine (Testcontainers etc.), but
 # code inside can create sibling containers and read anything the host user
 # can read. Trusted projects only.
 set -euo pipefail
 
 usage() {
-  echo 'usage: omp-sbx [--host-engine] [--keys FILE] [image]'
+  echo 'usage: playpen [--host-engine] [--keys FILE] [image]'
 }
 
 HOST_ENGINE=0
-KEYS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omp-sbx/keys.conf"
+KEYS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/playpen/keys.conf"
 KEYS_EXPLICIT=0
 IMAGE=
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host-engine) HOST_ENGINE=1 ;;
     --keys)
-      [[ $# -ge 2 ]] || { echo "omp-sbx: --keys needs a file argument" >&2; exit 1; }
+      [[ $# -ge 2 ]] || { echo "playpen: --keys needs a file argument" >&2; exit 1; }
       KEYS_FILE="$2"; KEYS_EXPLICIT=1; shift
       ;;
     -h|--help) usage; exit 0 ;;
-    -*) echo "omp-sbx: unknown option: $1" >&2; usage >&2; exit 1 ;;
+    -*) echo "playpen: unknown option: $1" >&2; usage >&2; exit 1 ;;
     *)
-      [[ -z "$IMAGE" ]] || { echo "omp-sbx: unexpected argument: $1" >&2; usage >&2; exit 1; }
+      [[ -z "$IMAGE" ]] || { echo "playpen: unexpected argument: $1" >&2; usage >&2; exit 1; }
       IMAGE="$1"
       ;;
   esac
   shift
 done
-IMAGE="${IMAGE:-omp-base}"
-if [[ "${OMP_SBX_HOST_ENGINE:-}" =~ ^(1|true|yes)$ ]]; then
+IMAGE="${IMAGE:-playpen-base}"
+if [[ "${PLAYPEN_HOST_ENGINE:-}" =~ ^(1|true|yes)$ ]]; then
   HOST_ENGINE=1
 fi
 
 ENV_ARGS=()
 if [[ ! -f "$KEYS_FILE" ]]; then
   if [[ "$KEYS_EXPLICIT" -eq 1 ]]; then
-    echo "omp-sbx: keys file not found: $KEYS_FILE" >&2
+    echo "playpen: keys file not found: $KEYS_FILE" >&2
     exit 1
   fi
-  echo "omp-sbx: $KEYS_FILE not found - launching without API keys" >&2
+  echo "playpen: $KEYS_FILE not found - launching without API keys" >&2
 else
   PERMS="$(stat -c '%a' "$KEYS_FILE")"
   if (( 8#$PERMS & 8#077 )); then
     chmod 600 "$KEYS_FILE"
-    echo "omp-sbx: $KEYS_FILE was group/other-readable - tightened to 600" >&2
+    echo "playpen: $KEYS_FILE was group/other-readable - tightened to 600" >&2
   fi
-  TMP_ENV="$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/omp-sbx-env.XXXXXX")"
+  TMP_ENV="$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/playpen-env.XXXXXX")"
   trap 'rm -f "$TMP_ENV"' EXIT
   chmod 600 "$TMP_ENV"
   while IFS='=' read -r name value || [[ -n "${name:-}" ]]; do
@@ -67,7 +67,7 @@ else
     [[ -z "$value" ]] && continue
     if [[ "$value" == op://* ]]; then
       if ! value="$(op read "$value")"; then
-        echo "omp-sbx: could not resolve 1Password reference for $name" >&2
+        echo "playpen: could not resolve 1Password reference for $name" >&2
         exit 1
       fi
     fi
@@ -81,10 +81,10 @@ fi
 ENGINE_ARGS=()
 if [[ "$HOST_ENGINE" -eq 1 ]]; then
   if [[ ! -S "/run/user/$(id -u)/podman/podman.sock" ]]; then
-    echo "omp-sbx: host podman socket not found - start it with: systemctl --user start podman.socket" >&2
+    echo "playpen: host podman socket not found - start it with: systemctl --user start podman.socket" >&2
     exit 1
   fi
-  echo "omp-sbx: host engine access enabled - the boundary is your host user" >&2
+  echo "playpen: host engine access enabled - the boundary is your host user" >&2
   ENGINE_ARGS+=(
     -v "/run/user/$(id -u)/podman/podman.sock:/run/podman/podman.sock:z"
     -e CONTAINER_HOST=unix:///run/podman/podman.sock
@@ -94,10 +94,10 @@ fi
 
 podman run --rm -it \
   --userns=keep-id \
-  --name "omp-agent-$$" \
+  --name "playpen-agent-$$" \
   -v "$PWD":/workspace:Z \
-  -v "${HOME}/.local/share/omp-home":/home/agent:Z \
-  -v omp-cargo:/opt/agent-cargo \
+  -v "${HOME}/.local/share/playpen-home":/home/agent:Z \
+  -v playpen-cargo:/opt/agent-cargo \
   "${ENGINE_ARGS[@]}" \
   "${ENV_ARGS[@]}" \
   "$IMAGE"

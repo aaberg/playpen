@@ -1,23 +1,23 @@
-# omp-container
+# playpen
 
 Personal agent sandbox: Oh My Pi in a rootless Podman container.
-Two layers: `omp-base` (language-neutral base, rebuild rarely) + thin
-per-language flavor images (`omp-rust`, `omp-jvm`, ...).
+Two layers: `playpen-base` (language-neutral base, rebuild rarely) + thin
+per-language flavor images (`playpen-rust`, `playpen-jvm`, ...).
 
 ## Layout
 
 ```
-base/                omp-base: Fedora, git, zsh, node, bun, omp, agent user
-flavors/rust/        omp-rust: rustup toolchain, sccache, native build deps
-flavors/jvm/         omp-jvm: JDK LTS, Maven, standalone Kotlin compiler
-bin/omp-sbx          launcher
-keys.conf.example    template for ~/.config/omp-sbx/keys.conf (API keys)
+base/                playpen-base: Fedora, git, zsh, node, bun, omp, agent user
+flavors/rust/        playpen-rust: rustup toolchain, sccache, native build deps
+flavors/jvm/         playpen-jvm: JDK LTS, Maven, standalone Kotlin compiler
+bin/playpen          launcher
+keys.conf.example    template for ~/.config/playpen/keys.conf (API keys)
 Makefile             build helpers
 ```
 
 Adding a flavor: one directory under `flavors/` with a Containerfile
-(`FROM localhost/omp-base:latest`), one rule in the Makefile, tag it
-`omp-<flavor>`. The launcher needs no changes: `omp-sbx omp-<flavor>`.
+(`FROM localhost/playpen-base:latest`), one rule in the Makefile, tag it
+`playpen-<flavor>`. The launcher needs no changes: `playpen playpen-<flavor>`.
 
 ## Setup
 
@@ -26,30 +26,30 @@ Adding a flavor: one directory under `flavors/` with a Containerfile
 make all              # or individually: make base, make rust, make jvm
 
 # 2. Install the launcher
-mkdir -p ~/bin && cp bin/omp-sbx ~/bin/ && chmod +x ~/bin/omp-sbx
+mkdir -p ~/bin && cp bin/playpen ~/bin/ && chmod +x ~/bin/playpen
 
 # 3. One-time: create the throwaway agent home
-mkdir -p ~/.local/share/omp-home
+mkdir -p ~/.local/share/playpen-home
 
 # 4. API keys: one NAME=value per line (format: keys.conf.example)
-mkdir -p ~/.config/omp-sbx && chmod 700 ~/.config/omp-sbx
+mkdir -p ~/.config/playpen && chmod 700 ~/.config/playpen
 echo 'MISTRAL_API_KEY=op://Private/Mistral API Key/credential' \
-  > ~/.config/omp-sbx/keys.conf
-chmod 600 ~/.config/omp-sbx/keys.conf
+  > ~/.config/playpen/keys.conf
+chmod 600 ~/.config/playpen/keys.conf
 ```
 
 ## Daily use
 
 ```bash
 cd ~/Development/myproject
-omp-sbx omp-rust    # Rust project
-omp-sbx omp-jvm     # JVM/Kotlin project
-omp-sbx             # no flavor: plain base
-omp-sbx --host-engine omp-rust   # trusted project: + host Podman socket
+playpen playpen-rust    # Rust project
+playpen playpen-jvm     # JVM/Kotlin project
+playpen                 # no flavor: plain base
+playpen --host-engine playpen-rust   # trusted project: + host Podman socket
 ```
 
 Inside the container, omp runs in yolo mode: its $HOME is
-`~/.local/share/omp-home` on your disk - expendable by design. The sandbox
+`~/.local/share/playpen-home` on your disk - expendable by design. The sandbox
 boundary is the container's mounts - by default just the workspace and
 the agent home.
 
@@ -58,7 +58,7 @@ the agent home.
 - Fedora is pinned in `base/Containerfile` (`ARG FEDORA_VERSION`); bump it and
   `make base` to move to a newer release.
 - Rust: `CARGO_HOME=/opt/agent-cargo`, mounted as the named podman volume
-  `omp-cargo`, so the registry cache and `cargo install`-ed tools persist
+  `playpen-cargo`, so the registry cache and `cargo install`-ed tools persist
   across sessions. sccache is wired in via `RUSTC_WRAPPER`; its cache lives
   under the persistent agent home, so clean rebuilds stay fast.
 - JVM: JDK 25 (LTS) via `java-25-openjdk-devel`; change `JDK_VERSION` in
@@ -68,7 +68,7 @@ the agent home.
 - `--userns=keep-id`: files the agent creates are owned by you on the host.
 - `:Z` labels bind mounts for SELinux (Fedora); the named volume is labeled
   automatically.
-- API keys: `~/.config/omp-sbx/keys.conf` (see `keys.conf.example`) - one
+- API keys: `~/.config/playpen/keys.conf` (see `keys.conf.example`) - one
   `NAME=value` per line; a value is a literal or an `op://` reference. The
   launcher resolves references with the 1Password CLI (vault must be
   unlocked - expect one biometric prompt per launch) and passes every key
@@ -81,7 +81,7 @@ the agent home.
   keep it mode 0600 (the launcher tightens it if looser) and prefer
   `op://`.
 - Host Podman access (Testcontainers etc.) is opt-in per launch:
-  `omp-sbx --host-engine <flavor>` or `OMP_SBX_HOST_ENGINE=1` (per-project
+  `playpen --host-engine <flavor>` or `PLAYPEN_HOST_ENGINE=1` (per-project
   via direnv). It mounts the host podman socket and points `CONTAINER_HOST`
   / `DOCKER_HOST` at it. Without it the container gets no engine. With it
   the isolation boundary is your host user: code inside can create sibling

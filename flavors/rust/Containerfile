@@ -1,6 +1,6 @@
-# omp-rust — Rust development on top of omp-base
-# Build: make rust   (or: podman build -t omp-rust flavors/rust)
-FROM localhost/omp-base:latest
+# playpen-rust — Rust development on top of playpen-base
+# Build: make rust   (or: podman build -t playpen-rust flavors/rust)
+FROM localhost/playpen-base:latest
 
 USER root
 
@@ -34,7 +34,7 @@ ENV PATH="/opt/agent-cargo/bin:/usr/local/cargo/bin:${PATH}" \
     RUSTUP_HOME=/usr/local/rustup
 
 # Cargo cache separate from the root-owned toolchain in /usr/local/cargo.
-# The launcher mounts the named podman volume `omp-cargo` here so the
+# The launcher mounts the named podman volume `playpen-cargo` here so the
 # registry cache and cargo-installed tools survive across sessions.
 ENV CARGO_HOME=/opt/agent-cargo
 RUN mkdir -p /opt/agent-cargo && chown 1000:1000 /opt/agent-cargo

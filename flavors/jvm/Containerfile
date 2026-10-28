@@ -1,6 +1,6 @@
-# omp-jvm — JVM/Kotlin development on top of omp-base
-# Build: make jvm   (or: podman build -t omp-jvm flavors/jvm)
-FROM localhost/omp-base:latest
+# playpen-jvm — JVM/Kotlin development on top of playpen-base
+# Build: make jvm   (or: podman build -t playpen-jvm flavors/jvm)
+FROM localhost/playpen-base:latest
 
 USER root
 

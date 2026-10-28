@@ -1,11 +1,11 @@
-# omp-sbx API keys
+# playpen API keys
 #
-# Live file: ~/.config/omp-sbx/keys.conf  (or a per-project file passed to
-#           omp-sbx via --keys)
+# Live file: ~/.config/playpen/keys.conf  (or a per-project file passed to
+#           playpen via --keys)
 # Format:   NAME=value - one per line (no spaces around '='). Blank lines
 #           and #-comments are allowed. The value is either:
 #             - a literal key: plaintext at rest, so this file must be
-#               mode 0600 (omp-sbx tightens it if looser)
+#               mode 0600 (playpen tightens it if looser)
 #             - an op:// reference, resolved via the 1Password CLI at launch
 #
 # MISTRAL_API_KEY=op://Private/Mistral API Key/credential
