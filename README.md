@@ -101,3 +101,8 @@ the agent home.
   on the engine - treat it as a trusted-project switch.
 - The agent's git identity: set it once inside the persistent home
   (`git config --global user.name/user.email`) or mount a minimal gitconfig.
+
+## Roadmap
+
+The plan - Rust launcher, harness layering, published images, installer,
+macOS support - lives in [ROADMAP.md](ROADMAP.md).
