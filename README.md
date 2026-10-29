@@ -15,7 +15,7 @@ engine: `make all ENGINE=docker`.
 base/                playpen-base: Fedora, git, bash, node, bun, omp, agent user
 flavors/rust/        playpen-rust: rustup toolchain, sccache, native build deps
 flavors/jvm/         playpen-jvm: JDK LTS, Maven, standalone Kotlin compiler
-bin/playpen          launcher
+launcher/            Rust launcher crate (binary: playpen)
 keys.conf.example    template for ~/.config/playpen/keys.conf (API keys)
 Makefile             build helpers
 ```
@@ -30,8 +30,8 @@ Adding a flavor: one directory under `flavors/` with a Containerfile
 # 1. Build everything (base first, then flavors)
 make all              # or individually: make base, make rust, make jvm
 
-# 2. Install the launcher
-mkdir -p ~/bin && cp bin/playpen ~/bin/ && chmod +x ~/bin/playpen
+# 2. Install the launcher (Rust binary to ~/.local/bin; needs cargo)
+make install
 
 # 3. One-time: create the throwaway agent home
 mkdir -p ~/.local/share/playpen-home

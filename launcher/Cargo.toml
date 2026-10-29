@@ -1,0 +1,26 @@
+[package]
+name = "playpen"
+version = "0.1.0"
+edition = "2021"
+description = "Launch an AI coding agent inside a sandboxed container"
+
+[[bin]]
+name = "playpen"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
+libc = "0.2"
+signal-hook = "0.3"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
