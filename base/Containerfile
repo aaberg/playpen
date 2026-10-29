@@ -1,5 +1,6 @@
 # playpen-base — personal base image for AI agent work
-# Language-neutral: OS, shell, git, node, and the omp coding agent.
+# Language-neutral: OS, shell, git, node, bun, and the agent user. Harnesses
+# (omp, ...) live in thin per-flavor layers the launcher builds on demand.
 # Rebuild rarely (new tools / Fedora release): make base
 ARG FEDORA_VERSION=44
 FROM registry.fedoraproject.org/fedora-minimal:${FEDORA_VERSION}
@@ -32,10 +33,6 @@ RUN curl -fsSL https://bun.com/install | bash \
 
 # Non-root agent user with its own throwaway home
 RUN useradd -m -s /bin/bash agent
-
-# Oh My Pi, installed for the agent user
-RUN npm install -g @oh-my-pi/pi-coding-agent \
-    && chown -R agent:agent /home/agent
 
 # Minimal agent-home bashrc (also applied to newly created homes via /etc/skel)
 RUN printf '%s\n' \

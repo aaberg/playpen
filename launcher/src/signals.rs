@@ -8,9 +8,10 @@
 //!   exit with 128+signal like a shell would report for itself. The bash
 //!   launcher leaked the file on SIGQUIT and SIGTERM; the port cleans up on
 //!   every terminating signal it can catch.
-//! - [`fail`]: the single exit path for fatal errors. The env-file is
-//!   deleted before exiting, because `process::exit` skips destructors -
-//!   the bash launcher's EXIT trap did this with a trap.
+//! - [`fail`] and [`exit_with_status`]: the launcher's exit paths for fatal
+//!   errors and failed engine children. The env-file is deleted before
+//!   exiting, because `process::exit` skips destructors - the bash
+//!   launcher's EXIT trap did this with a trap.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -45,11 +46,30 @@ pub fn register_env_file(path: PathBuf) {
     let _ = ENV_FILE.set(path);
 }
 
-/// Print a fatal error and exit 1, deleting the env-file first.
-pub fn fail(message: String) -> ! {
+/// Delete the registered env-file, if any.
+fn cleanup() {
     if let Some(path) = ENV_FILE.get() {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// An engine child's exit status as our exit code: its own when it exited,
+/// 128+signal when it was killed - what a shell would report.
+pub fn status_code(status: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+}
+
+/// Exit with an engine child's status code, deleting the env-file first
+/// like [`fail`] does.
+pub fn exit_with_status(status: &std::process::ExitStatus) -> ! {
+    cleanup();
+    std::process::exit(status_code(status))
+}
+
+/// Print a fatal error and exit 1, deleting the env-file first.
+pub fn fail(message: String) -> ! {
+    cleanup();
     eprintln!("{message}");
     std::process::exit(1)
 }

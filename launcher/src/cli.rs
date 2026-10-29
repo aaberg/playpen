@@ -1,12 +1,13 @@
-//! CLI parsing. The flags and their semantics are the phase-1 spec, ported
-//! from `bin/playpen`; messages marked "spec" keep the bash launcher's exact
-//! wording. Everything downstream receives a fully resolved [`Config`].
+//! CLI parsing. The run flags are the phase-1 spec, ported from
+//! `bin/playpen`; messages marked "spec" keep the bash launcher's exact
+//! wording. Phase 2 adds the `--harness` flag and the `harness` subcommand.
+//! Everything downstream receives a fully resolved [`Action`].
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::exit;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use crate::host::Host;
 
@@ -15,7 +16,7 @@ use crate::host::Host;
     name = "playpen",
     version,
     about = "Run an AI coding agent inside a sandboxed container",
-    long_about = "Run an AI coding agent (omp by default) inside a rootless container.\n\
+    long_about = "Run an AI coding agent (harness omp by default) inside a rootless container.\n\
                   The workspace is mounted at /workspace; the agent gets a throwaway\n\
                   home that persists on the host.",
     after_help = "Environment:\n  \
@@ -24,11 +25,17 @@ use crate::host::Host;
         Keys file (override with --keys FILE):\n  \
         ~/.config/playpen/keys.conf - one NAME=value per line; a value is a literal\n  \
         or an op:// reference resolved with the 1Password CLI at launch.\n\n\
+        Harness selection (override with --harness NAME):\n  \
+        ~/.config/playpen/harness.conf - set by `playpen harness`\n\n\
+        Bare playpen-* images get a thin harness layer (playpen-jvm ->\n  \
+        playpen-jvm:omp), built on demand; tagged or foreign images run as-is.\n\n\
         Examples:\n  \
         playpen playpen-rust                     run omp in the Rust flavor\n  \
         playpen --shell playpen-jvm              bash in the JVM flavor\n  \
         playpen playpen-jvm -- omp --version     one-off command\n  \
-        playpen --host-engine playpen-rust       grant host engine access"
+        playpen --host-engine playpen-rust       grant host engine access\n  \
+        playpen harness                          pick the default harness\n  \
+        playpen harness update                   refresh installed harnesses"
 )]
 pub struct Cli {
     /// Mount the host container engine socket (trusted projects only)
@@ -43,6 +50,10 @@ pub struct Cli {
     #[arg(long)]
     pub shell: bool,
 
+    /// Run this harness instead of the selected one
+    #[arg(long, value_name = "NAME")]
+    pub harness: Option<String>,
+
     /// Container image to run
     #[arg(value_name = "IMAGE", default_value = "playpen-base")]
     pub image: String,
@@ -50,20 +61,61 @@ pub struct Cli {
     /// Command passed verbatim to the container (everything after --)
     #[arg(value_name = "CMD", last = true, num_args = 0..)]
     pub command: Vec<OsString>,
+
+    /// Subcommands; none means a plain run
+    #[command(subcommand)]
+    pub sub: Option<Sub>,
 }
 
-/// The resolved launch configuration.
+/// The launcher's subcommands.
+#[derive(Subcommand, Debug)]
+pub enum Sub {
+    /// Pick the default harness (stored in ~/.config/playpen/harness.conf)
+    Harness {
+        /// Rebuild installed harness images with fresh harness versions
+        #[command(subcommand)]
+        cmd: Option<HarnessSub>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HarnessSub {
+    /// Rebuild existing playpen*:<harness> images, cache-busted
+    Update {
+        /// Harness to update [default: the selected one]
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
+}
+
+/// What the user asked for, fully resolved.
+#[derive(Debug)]
+pub enum Action {
+    /// A container run.
+    Run(Config),
+    /// `playpen harness`: the selection menu.
+    HarnessMenu,
+    /// `playpen harness update [NAME]`.
+    HarnessUpdate { name: Option<String> },
+}
+
+/// The resolved launch configuration. The container command is resolved in
+/// main, where the harness (and its exec name) is known.
 #[derive(Debug)]
 pub struct Config {
     pub host_engine: bool,
     pub keys_file: PathBuf,
     pub keys_explicit: bool,
+    /// The `--harness` flag, when given.
+    pub harness: Option<String>,
+    pub shell: bool,
     pub image: String,
+    /// Non-empty only with an explicit `-- CMD`.
     pub command: Vec<OsString>,
 }
 
 /// Parse argv, exiting on error or `-h`/`--help`/`--version`.
-pub fn parse(host: &Host) -> Config {
+pub fn parse(host: &Host) -> Action {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let argv = match normalize(&argv) {
         Ok(argv) => argv,
@@ -122,32 +174,31 @@ fn normalize(argv: &[OsString]) -> Result<Vec<OsString>, &'static str> {
     Ok(out)
 }
 
-fn resolve(cli: Cli, host: &Host) -> Config {
+fn resolve(cli: Cli, host: &Host) -> Action {
+    if let Some(Sub::Harness { cmd }) = cli.sub {
+        return match cmd {
+            None => Action::HarnessMenu,
+            Some(HarnessSub::Update { name }) => Action::HarnessUpdate { name },
+        };
+    }
     if cli.shell && !cli.command.is_empty() {
         // spec
         eprintln!("playpen: --shell cannot be combined with a command after --");
         exit(1);
     }
-    let command = if cli.command.is_empty() {
-        if cli.shell {
-            vec![OsString::from("/bin/bash")]
-        } else {
-            vec![OsString::from("omp")]
-        }
-    } else {
-        cli.command
-    };
     let (keys_file, keys_explicit) = match cli.keys {
         Some(file) => (file, true),
         None => (host.default_keys_file(), false),
     };
-    Config {
+    Action::Run(Config {
         host_engine: cli.host_engine || host.host_engine_env,
         keys_file,
         keys_explicit,
+        harness: cli.harness,
+        shell: cli.shell,
         image: cli.image,
-        command,
-    }
+        command: cli.command,
+    })
 }
 
 #[cfg(test)]
@@ -272,32 +323,79 @@ mod tests {
             host_engine: false,
             keys: None,
             shell,
+            harness: None,
             image: image.to_string(),
             command,
+            sub: None,
         }
     }
 
     #[test]
-    fn command_defaults() {
+    fn subcommands_beat_the_image_positional() {
+        let c = Cli {
+            sub: Some(Sub::Harness { cmd: None }),
+            ..cli(false, "playpen-base", vec![])
+        };
+        assert!(matches!(resolve(c, &host()), Action::HarnessMenu));
+
+        let c = Cli {
+            sub: Some(Sub::Harness {
+                cmd: Some(HarnessSub::Update { name: None }),
+            }),
+            ..cli(false, "playpen-base", vec![])
+        };
+        assert!(matches!(resolve(c, &host()), Action::HarnessUpdate { .. }));
+
+        let c = Cli {
+            sub: Some(Sub::Harness {
+                cmd: Some(HarnessSub::Update {
+                    name: Some("omp".to_string()),
+                }),
+            }),
+            ..cli(false, "playpen-base", vec![])
+        };
+        match resolve(c, &host()) {
+            Action::HarnessUpdate { name } => assert_eq!(name.as_deref(), Some("omp")),
+            _ => panic!("expected HarnessUpdate"),
+        }
+
+        assert!(matches!(
+            resolve(cli(false, "playpen-base", vec![]), &host()),
+            Action::Run(_)
+        ));
+    }
+
+    #[test]
+    fn run_config_carries_flags_and_command_verbatim() {
+        let c = cli(true, "playpen-jvm", vec![]);
+        let Action::Run(cfg) = resolve(c, &host()) else {
+            panic!("expected run");
+        };
+        assert!(cfg.shell);
+        assert_eq!(cfg.image, "playpen-jvm");
+        assert!(cfg.command.is_empty(), "no explicit command");
+
+        let c = cli(false, "playpen-jvm", vec!["omp".into(), "--version".into()]);
+        let Action::Run(cfg) = resolve(c, &host()) else {
+            panic!("expected run");
+        };
+        assert!(!cfg.shell);
         assert_eq!(
-            resolve(cli(true, "playpen-base", vec![]), &host()).command,
-            vec![OsString::from("/bin/bash")],
-            "--shell defaults to /bin/bash"
+            cfg.command,
+            vec![OsString::from("omp"), OsString::from("--version")]
         );
-        assert_eq!(
-            resolve(cli(false, "playpen-base", vec![]), &host()).command,
-            vec![OsString::from("omp")],
-            "no command defaults to omp"
-        );
-        assert_eq!(
-            resolve(
-                cli(false, "playpen-jvm", vec!["omp".into(), "--version".into()]),
-                &host()
-            )
-            .command,
-            vec![OsString::from("omp"), OsString::from("--version")],
-            "explicit command wins"
-        );
+    }
+
+    #[test]
+    fn harness_flag_is_carried_unresolved() {
+        let c = Cli {
+            harness: Some("vibe".to_string()),
+            ..cli(false, "playpen-base", vec![])
+        };
+        let Action::Run(cfg) = resolve(c, &host()) else {
+            panic!("expected run");
+        };
+        assert_eq!(cfg.harness.as_deref(), Some("vibe"));
     }
 
     #[test]
@@ -306,11 +404,15 @@ mod tests {
             keys: Some(PathBuf::from("/tmp/mykeys")),
             ..cli(false, "playpen-base", vec![])
         };
-        let cfg = resolve(c, &host());
+        let Action::Run(cfg) = resolve(c, &host()) else {
+            panic!("expected run");
+        };
         assert_eq!(cfg.keys_file, PathBuf::from("/tmp/mykeys"));
         assert!(cfg.keys_explicit);
 
-        let cfg = resolve(cli(false, "playpen-base", vec![]), &host());
+        let Action::Run(cfg) = resolve(cli(false, "playpen-base", vec![]), &host()) else {
+            panic!("expected run");
+        };
         assert_eq!(
             cfg.keys_file,
             PathBuf::from("/home/tester/.config/playpen/keys.conf")
@@ -322,7 +424,10 @@ mod tests {
     fn host_engine_env_is_honored() {
         let mut h = host();
         h.host_engine_env = true;
-        assert!(resolve(cli(false, "playpen-base", vec![]), &h).host_engine);
+        let Action::Run(cfg) = resolve(cli(false, "playpen-base", vec![]), &h) else {
+            panic!("expected run");
+        };
+        assert!(cfg.host_engine);
 
         let mut h = host();
         h.host_engine_env = false;
@@ -330,7 +435,13 @@ mod tests {
             host_engine: true,
             ..cli(false, "playpen-base", vec![])
         };
-        assert!(resolve(c, &h).host_engine);
-        assert!(!resolve(cli(false, "playpen-base", vec![]), &h).host_engine);
+        let Action::Run(cfg) = resolve(c, &h) else {
+            panic!("expected run");
+        };
+        assert!(cfg.host_engine);
+        let Action::Run(cfg) = resolve(cli(false, "playpen-base", vec![]), &h) else {
+            panic!("expected run");
+        };
+        assert!(!cfg.host_engine);
     }
 }

@@ -58,6 +58,14 @@ impl Host {
         }
     }
 
+    /// `~/.config/playpen/harness.conf` (honors XDG_CONFIG_HOME).
+    pub fn harness_conf_file(&self) -> PathBuf {
+        match &self.config_home {
+            Some(dir) => dir.join("playpen/harness.conf"),
+            None => self.home.join(".config/playpen/harness.conf"),
+        }
+    }
+
     /// `~/.local/share/playpen-home` (honors XDG_DATA_HOME).
     pub fn agent_home_dir(&self) -> PathBuf {
         match &self.data_home {
