@@ -4,35 +4,86 @@
 //!
 //! Every test runs in an isolated fixture (HOME, XDG dirs, workspace) with a
 //! scrubbed environment, so results do not depend on the host's podman,
-//! docker, op or ~/.config.
+//! docker, op or ~/.config. The stub engine also fakes the image commands
+//! phase 2 added: `image inspect --format {{.Created}}` and `images` read a
+//! state file of `ref<TAB>created` lines, and `build` records its argv plus
+//! the Containerfile it was handed.
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 const PLAYPEN_BIN: &str = env!("CARGO_BIN_EXE_playpen");
 
-/// A stub engine: records its argv (NUL-separated), copies the contents of
-/// any --env-file it was handed, then exits with $STUB_EXIT (or dies by
-/// $STUB_SIGNAL so the launcher sees a signaled child). Builtins only: PATH
-/// in tests contains just this stub.
+/// A stub engine. `run` records its argv (NUL-separated) and copies the
+/// contents of any --env-file, then exits with $STUB_EXIT (or dies by
+/// $STUB_SIGNAL so the launcher sees a signaled child). `build` records its
+/// argv plus the recipe from the context dir. `image inspect` and `images`
+/// read $STUB_STATE_DIR/images.txt. Builtins only: PATH in tests contains
+/// just this stub.
 const ENGINE_STUB: &str = r#"#!/bin/bash
-printf '%s\0' "$@" > "$STUB_ARGS_FILE"
-: > "$STUB_ENV_FILE"
-while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "--env-file" ]]; then
-    while IFS= read -r line; do
-      printf '%s\n' "$line"
-    done < "$2" >> "$STUB_ENV_FILE"
-  fi
-  shift
-done
-if [[ -n "${STUB_SIGNAL:-}" ]]; then kill -"${STUB_SIGNAL}" "$$"; fi
-exit "${STUB_EXIT:-0}"
+case "$1" in
+  run)
+    printf '%s\0' "$@" > "$STUB_ARGS_FILE"
+    : > "$STUB_ENV_FILE"
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "--env-file" ]]; then
+        while IFS= read -r line; do
+          printf '%s\n' "$line"
+        done < "$2" >> "$STUB_ENV_FILE"
+      fi
+      shift
+    done
+    if [[ -n "${STUB_SIGNAL:-}" ]]; then kill -"${STUB_SIGNAL}" "$$"; fi
+    exit "${STUB_EXIT:-0}"
+    ;;
+  build)
+    ctx="${@: -1}"
+    {
+      printf '%s\0' "$@"
+      printf '%s\0' "RECIPE"
+      printf '%s\0' "$(< "$ctx/Containerfile")"$'\n'
+      printf '%s\0' "END"
+    } >> "$STUB_BUILDS_FILE"
+    exit 0
+    ;;
+  image)
+    ref="${@: -1}"
+    while IFS=$'\t' read -r r c; do
+      if [[ "$r" == "$ref" ]]; then
+        printf '%s\n' "$c"
+        exit 0
+      fi
+    done < "$STUB_STATE_DIR/images.txt"
+    printf 'Error: no such image: %s\n' "$ref" >&2
+    exit 1
+    ;;
+  images)
+    while IFS=$'\t' read -r r _; do
+      printf '%s\n' "$r"
+    done < "$STUB_STATE_DIR/images.txt"
+    exit 0
+    ;;
+esac
+exit 0
 "#;
 
 const OP_STUB: &str = "#!/bin/bash\necho resolved-secret-value\nexit ${STUB_OP_STATUS:-0}\n";
+
+/// The omp harness recipe the launcher generates for a flavor.
+fn omp_recipe(flavor: &str) -> String {
+    format!(
+        "# playpen harness layer: omp on {flavor}\n\
+         FROM {flavor}:latest\n\
+         USER root\n\
+         RUN npm install -g @oh-my-pi/pi-coding-agent \\\n\
+         \x20   && chown -R agent:agent /home/agent\n\
+         USER agent\n\
+         WORKDIR /workspace\n"
+    )
+}
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -42,7 +93,9 @@ struct Fixture {
     data: PathBuf,
     runtime: PathBuf,
     work: PathBuf,
+    state: PathBuf,
     args_file: PathBuf,
+    builds_file: PathBuf,
     env_file: PathBuf,
 }
 
@@ -56,7 +109,9 @@ impl Fixture {
             data: dir.path().join("data"),
             runtime: dir.path().join("runtime"),
             work: dir.path().join("work"),
+            state: dir.path().join("state"),
             args_file: dir.path().join("stub-args"),
+            builds_file: dir.path().join("stub-builds"),
             env_file: dir.path().join("stub-env"),
             _dir: dir,
         };
@@ -67,9 +122,11 @@ impl Fixture {
             &fixture.data,
             &fixture.runtime,
             &fixture.work,
+            &fixture.state,
         ] {
             fs::create_dir_all(dir).unwrap();
         }
+        fs::write(fixture.state.join("images.txt"), "").unwrap();
         fixture
     }
 
@@ -89,6 +146,38 @@ impl Fixture {
         file
     }
 
+    /// Seed an image with a Created timestamp (any engine layout).
+    fn image(&self, image_ref: &str, created: &str) {
+        let line = format!("{image_ref}\t{created}\n");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(self.state.join("images.txt"))
+            .unwrap();
+        file.write_all(line.as_bytes()).unwrap();
+    }
+
+    /// Seed `playpen-<flavor>:latest` only: its harness image is missing,
+    /// so a run must build the layer.
+    fn seed_flavor(&self, flavor: &str) {
+        self.image(&format!("{flavor}:latest"), "2024-01-01T00:00:00Z");
+    }
+
+    /// Seed the flavor and a fresh (newer) harness layer: no build needed.
+    fn seed_fresh(&self, flavor: &str) {
+        self.seed_flavor(flavor);
+        self.image(&format!("{flavor}:omp"), "2025-06-01T00:00:00Z");
+    }
+
+    fn harness_conf(&self, content: &str) {
+        let dir = self.config.join("playpen");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("harness.conf"), content).unwrap();
+    }
+
+    fn harness_conf_contents(&self) -> String {
+        fs::read_to_string(self.config.join("playpen/harness.conf")).unwrap_or_default()
+    }
+
     fn playpen(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(PLAYPEN_BIN);
         cmd.env_clear();
@@ -100,6 +189,8 @@ impl Fixture {
         cmd.env("XDG_RUNTIME_DIR", &self.runtime);
         cmd.env("STUB_ARGS_FILE", &self.args_file);
         cmd.env("STUB_ENV_FILE", &self.env_file);
+        cmd.env("STUB_BUILDS_FILE", &self.builds_file);
+        cmd.env("STUB_STATE_DIR", &self.state);
         cmd.current_dir(&self.work);
         cmd.args(args);
         cmd
@@ -117,7 +208,23 @@ impl Fixture {
         cmd.output().expect("run playpen")
     }
 
-    /// The argv the stub engine received.
+    /// Run with the given stdin, for the interactive menu.
+    fn run_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
+        let mut cmd = self.playpen(args);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn playpen");
+        child
+            .stdin
+            .as_mut()
+            .expect("piped stdin")
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().expect("wait playpen")
+    }
+
+    /// The argv the stub engine received for `run`.
     fn argv(&self) -> Vec<String> {
         let bytes = fs::read(&self.args_file).unwrap_or_default();
         bytes
@@ -127,6 +234,34 @@ impl Fixture {
             .collect()
     }
 
+    /// The recorded `build` invocations: (argv, recipe) per build.
+    fn builds(&self) -> Vec<(Vec<String>, String)> {
+        let bytes = fs::read(&self.builds_file).unwrap_or_default();
+        let chunks: Vec<String> = bytes
+            .split(|b| *b == 0)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect();
+        let mut builds = Vec::new();
+        let mut i = 0;
+        while i < chunks.len() {
+            if chunks[i].is_empty() || chunks[i] == "END" {
+                i += 1;
+                continue;
+            }
+            let mut argv = Vec::new();
+            while i < chunks.len() && chunks[i] != "RECIPE" {
+                argv.push(chunks[i].clone());
+                i += 1;
+            }
+            if i + 1 >= chunks.len() {
+                break; // truncated: no recipe chunk
+            }
+            builds.push((argv, chunks[i + 1].clone()));
+            i += 2; // the trailing END is skipped at the loop top
+        }
+        builds
+    }
+
     /// Contents of the env-file the engine received, or "" when none.
     fn env_file_contents(&self) -> String {
         fs::read_to_string(&self.env_file).unwrap_or_default()
@@ -134,6 +269,10 @@ impl Fixture {
 
     fn stderr(&self, out: &Output) -> String {
         String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    fn stdout(&self, out: &Output) -> String {
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     fn leftover_env_files(&self) -> Vec<String> {
@@ -152,6 +291,31 @@ impl Fixture {
             out.status.code(),
             self.stderr(out)
         );
+    }
+
+    /// A recorded build: right tag, recipe, and -f pointing into the context.
+    fn assert_build(&self, build: &(Vec<String>, String), target: &str, recipe: &str) {
+        let (argv, recorded_recipe) = build;
+        assert_eq!(argv[0], "build");
+        let target_pos = argv
+            .iter()
+            .position(|a| a == "-t")
+            .expect("build passes -t")
+            + 1;
+        assert_eq!(argv[target_pos], target);
+        let file = argv
+            .iter()
+            .zip(argv.iter().skip(1))
+            .find(|(a, _)| a.as_str() == "-f")
+            .map(|(_, b)| b.clone())
+            .expect("build passes -f");
+        let context = argv.last().unwrap();
+        assert!(
+            file.starts_with(&format!("{context}/")),
+            "-f file lives in the context: {file}"
+        );
+        assert!(file.ends_with("/Containerfile"), "-f names the recipe: {file}");
+        assert_eq!(recorded_recipe, recipe);
     }
 }
 
@@ -179,11 +343,22 @@ fn assert_container_name_pattern(argv: &[String]) {
 }
 
 #[test]
-fn default_run_is_podman_with_omp() {
+fn default_run_builds_harness_then_runs_omp() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_flavor("playpen-base");
     let out = f.run(&[]);
     f.assert_ok(&out);
+
+    // the harness layer is missing: one build with the omp recipe
+    let builds = f.builds();
+    assert_eq!(builds.len(), 1, "one build: {builds:?}");
+    f.assert_build(&builds[0], "playpen-base:omp", &omp_recipe("playpen-base"));
+    assert!(
+        f.stderr(&out).contains("playpen: building harness image playpen-base:omp"),
+        "the build is announced: {}",
+        f.stderr(&out)
+    );
 
     let argv = f.argv();
     assert_eq!(
@@ -199,7 +374,7 @@ fn default_run_is_podman_with_omp() {
             format!("{}:/workspace:Z", f.work.display()),
             "-v".to_string(),
             format!("{}:/home/agent:Z", f.data.join("playpen-home").display()),
-            "playpen-base".to_string(),
+            "playpen-base:omp".to_string(),
             "omp".to_string(),
         ]
     );
@@ -213,13 +388,66 @@ fn default_run_is_podman_with_omp() {
 }
 
 #[test]
+fn fresh_harness_image_is_not_rebuilt() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
+    let out = f.run(&[]);
+    f.assert_ok(&out);
+    assert!(f.builds().is_empty(), "nothing to build: {:?}", f.builds());
+    assert!(f.argv().contains(&"playpen-base:omp".to_string()));
+}
+
+#[test]
+fn stale_harness_image_is_rebuilt() {
+    // podman-format Created values prove the other timestamp layout parses
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-jvm:latest", "2025-11-02 10:00:00.000000000 +0100 CET");
+    f.image("playpen-jvm:omp", "2025-11-01 09:00:00.000000000 +0100 CET");
+    let out = f.run(&["playpen-jvm"]);
+    f.assert_ok(&out);
+
+    let builds = f.builds();
+    assert_eq!(builds.len(), 1, "one rebuild: {builds:?}");
+    let (argv, _recipe) = &builds[0];
+    assert_eq!(argv[0], "build");
+    assert!(
+        !argv.contains(&"--no-cache".to_string()),
+        "staleness rebuilds use the cache: {argv:?}"
+    );
+    f.assert_build(&builds[0], "playpen-jvm:omp", &omp_recipe("playpen-jvm"));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: rebuilding harness image playpen-jvm:omp (flavor image is newer)"));
+    assert!(f.argv().contains(&"playpen-jvm:omp".to_string()));
+}
+
+#[test]
+fn missing_flavor_image_is_fatal_with_a_hint() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    let out = f.run(&["playpen-jvm"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: playpen-jvm:latest not found - build the flavor first (make jvm)"));
+    assert!(f.builds().is_empty(), "no build without a flavor");
+    assert!(f.argv().is_empty(), "the engine must not run");
+}
+
+#[test]
 fn shell_mode_runs_bash() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
     let out = f.run(&["--shell"]);
     f.assert_ok(&out);
     let argv = f.argv();
-    let pos = argv.iter().position(|a| a == "playpen-base").expect("image");
+    let pos = argv
+        .iter()
+        .position(|a| a == "playpen-base:omp")
+        .expect("harness image");
     assert_eq!(&argv[pos + 1..], &["/bin/bash".to_string()]);
     assert_eq!(argv.len(), pos + 2, "bash is the only command word: {argv:?}");
 }
@@ -228,18 +456,23 @@ fn shell_mode_runs_bash() {
 fn passthrough_command_wins_and_keeps_flags() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-jvm");
+    f.seed_fresh("playpen-base");
 
     let out = f.run(&["playpen-jvm", "--", "omp", "--version"]);
     f.assert_ok(&out);
     let argv = f.argv();
-    let pos = argv.iter().position(|a| a == "playpen-jvm").expect("image");
+    let pos = argv.iter().position(|a| a == "playpen-jvm:omp").expect("image");
     assert_eq!(&argv[pos + 1..], &["omp".to_string(), "--version".to_string()]);
 
     // flag-like words and further `--` stay verbatim
     let out = f.run(&["--", "bash", "-c", "true", "--tail"]);
     f.assert_ok(&out);
     let argv = f.argv();
-    let pos = argv.iter().position(|a| a == "playpen-base").expect("default image");
+    let pos = argv
+        .iter()
+        .position(|a| a == "playpen-base:omp")
+        .expect("default image");
     assert_eq!(
         &argv[pos + 1..],
         &[
@@ -267,6 +500,9 @@ fn shell_and_command_conflict_is_an_error() {
 fn cargo_volume_only_for_rust_images() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
+    f.seed_fresh("playpen-rust");
+    f.seed_fresh("playpen-rust-nightly");
 
     let out = f.run(&["playpen-rust"]);
     f.assert_ok(&out);
@@ -279,7 +515,10 @@ fn cargo_volume_only_for_rust_images() {
         .iter()
         .position(|a| a.ends_with(":/home/agent:Z"))
         .expect("home mount");
-    let image = argv.iter().position(|a| a == "playpen-rust").expect("image");
+    let image = argv
+        .iter()
+        .position(|a| a == "playpen-rust:omp")
+        .expect("image");
     assert!(home < cargo && cargo < image, "volume sits between home and image");
 
     let out = f.run(&["playpen-base"]);
@@ -296,6 +535,7 @@ fn cargo_volume_only_for_rust_images() {
 fn docker_runs_as_invoking_user() {
     let f = Fixture::new();
     f.stub_engine("docker");
+    f.seed_fresh("playpen-base");
     let out = f.run_with(&[], &[("PLAYPEN_ENGINE", "docker")]);
     f.assert_ok(&out);
     let argv = f.argv();
@@ -317,12 +557,14 @@ fn autodetect_prefers_podman_then_docker() {
     let f = Fixture::new();
     f.stub_engine("podman");
     f.stub_engine("docker");
+    f.seed_fresh("playpen-base");
     let out = f.run(&[]);
     f.assert_ok(&out);
     assert!(f.argv().contains(&"--userns=keep-id".to_string()));
 
     let f = Fixture::new();
     f.stub_engine("docker");
+    f.seed_fresh("playpen-base");
     let out = f.run(&[]);
     f.assert_ok(&out);
     assert!(!f.argv().contains(&"--userns=keep-id".to_string()));
@@ -353,6 +595,7 @@ fn keys_lifecycle_literal_and_op_reference() {
     let f = Fixture::new();
     f.stub_engine("podman");
     f.stub_op();
+    f.seed_fresh("playpen-base");
     f.keys_conf(
         "MISTRAL_API_KEY=literal-key\n\
          # a comment\n\
@@ -366,7 +609,10 @@ fn keys_lifecycle_literal_and_op_reference() {
         .iter()
         .position(|a| a == "--env-file")
         .expect("--env-file present");
-    let image = argv.iter().position(|a| a == "playpen-base").expect("image");
+    let image = argv
+        .iter()
+        .position(|a| a == "playpen-base:omp")
+        .expect("image");
     assert!(envfile < image);
     let path = &argv[envfile + 1];
     assert!(
@@ -387,6 +633,7 @@ fn keys_parsing_edges() {
     let f = Fixture::new();
     f.stub_engine("podman");
     f.stub_op();
+    f.seed_fresh("playpen-base");
     f.keys_conf(
         "# full line comment\n\
          \n\
@@ -414,6 +661,7 @@ fn keys_parsing_edges() {
 fn keys_op_failure_aborts_launch() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
     write_exec(
         &f.bin.join("op"),
         "#!/bin/bash\necho nope >&2\nexit 1\n",
@@ -432,6 +680,7 @@ fn keys_op_failure_aborts_launch() {
 fn keys_missing_explicit_file_is_fatal() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
     let out = f.run(&["--keys", "/nonexistent/keys.conf"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(f
@@ -443,6 +692,7 @@ fn keys_missing_explicit_file_is_fatal() {
 fn keys_file_with_only_comments_launches_without_env_file() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
     f.keys_conf("# nothing here\n\n");
     let out = f.run(&[]);
     f.assert_ok(&out);
@@ -454,6 +704,7 @@ fn keys_file_with_only_comments_launches_without_env_file() {
 fn keys_permissions_are_tightened() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
     let keys = f.keys_conf("KEY=value\n");
     fs::set_permissions(&keys, fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -475,6 +726,7 @@ fn keys_permissions_are_tightened() {
 fn host_engine_docker_mounts_socket() {
     let f = Fixture::new();
     f.stub_engine("docker");
+    f.seed_fresh("playpen-base");
     let sock_dir = f.home.join(".docker/run");
     fs::create_dir_all(&sock_dir).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(sock_dir.join("docker.sock")).unwrap();
@@ -539,6 +791,7 @@ fn host_engine_docker_missing_socket_is_fatal() {
 fn host_engine_via_environment_variable() {
     let f = Fixture::new();
     f.stub_engine("docker");
+    f.seed_fresh("playpen-base");
     let sock_dir = f.home.join(".docker/run");
     fs::create_dir_all(&sock_dir).unwrap();
     let listener = std::os::unix::net::UnixListener::bind(sock_dir.join("docker.sock")).unwrap();
@@ -567,6 +820,7 @@ fn host_engine_via_environment_variable() {
 fn exit_code_of_the_container_propagates() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
     let out = f.run_with(&[], &[("STUB_EXIT", "42")]);
     assert_eq!(out.status.code(), Some(42));
 }
@@ -575,6 +829,7 @@ fn exit_code_of_the_container_propagates() {
 fn signaled_container_exits_128_plus_signal() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
     let out = f.run_with(&[], &[("STUB_SIGNAL", "TERM")]);
     assert_eq!(out.status.code(), Some(143));
 }
@@ -583,15 +838,35 @@ fn signaled_container_exits_128_plus_signal() {
 fn sigquit_removes_the_env_file_and_exits_131() {
     // SIGQUIT must not leak the resolved secrets: the signal layer removes
     // the env-file and exits 128+3 while the engine child is still running.
-    // The stub quits its parent, then closes the inherited pipe fds (so
-    // output() gets EOF as soon as the launcher dies) and sleeps to keep
-    // the launcher blocked in status() - no race with normal completion.
+    // The stub plays along with the build flow (harness image missing ->
+    // build succeeds) and quits its parent at `run` time, then closes the
+    // inherited pipe fds (so output() gets EOF as soon as the launcher dies)
+    // and sleeps to keep the launcher blocked in status() - no race with
+    // normal completion.
     let f = Fixture::new();
     f.stub_op();
+    f.seed_flavor("playpen-base");
     f.keys_conf("OPKEY=op://Private/x/y\n");
     write_exec(
         &f.bin.join("podman"),
-        "#!/bin/bash\nkill -QUIT \"$PPID\"\nexec >/dev/null 2>&1\nsleep 5\nexit 0\n",
+        r#"#!/bin/bash
+case "$1" in
+  run)
+    kill -QUIT "$PPID"
+    exec >/dev/null 2>&1
+    sleep 5
+    exit 0
+    ;;
+  image)
+    if [[ "${@: -1}" == "playpen-base:omp" ]]; then exit 1; fi
+    printf '2024-01-01 00:00:00.000000000 +0000 UTC\n'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
     );
     let out = f.run(&[]);
     assert_eq!(out.status.code(), Some(131));
@@ -607,10 +882,14 @@ fn keys_flag_after_separator_is_a_passthrough() {
     // container command, it must not trip launcher validation
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
     let out = f.run(&["--", "echo", "--keys"]);
     f.assert_ok(&out);
     let argv = f.argv();
-    let pos = argv.iter().position(|a| a == "playpen-base").expect("default image");
+    let pos = argv
+        .iter()
+        .position(|a| a == "playpen-base:omp")
+        .expect("default image");
     assert_eq!(&argv[pos + 1..], &["echo".to_string(), "--keys".to_string()]);
 }
 
@@ -620,6 +899,7 @@ fn keys_flag_may_take_the_separator_as_its_value() {
     // is then a missing keys file named "--" (not a usage error)
     let f = Fixture::new();
     f.stub_engine("podman");
+    f.seed_flavor("playpen-jvm");
     let out = f.run(&["--keys", "--", "playpen-jvm"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(f.stderr(&out).contains("keys file not found: --"));
@@ -663,11 +943,187 @@ fn help_and_version_print_and_exit_zero() {
     let f = Fixture::new();
     let out = f.run(&["--help"]);
     assert_eq!(out.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = f.stdout(&out);
     assert!(stdout.contains("playpen"));
     assert!(stdout.contains("PLAYPEN_ENGINE"));
+    assert!(stdout.contains("harness"), "help mentions the harness layering");
 
     let out = f.run(&["--version"]);
     assert_eq!(out.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&out.stdout).contains("playpen"));
+    assert!(f.stdout(&out).contains("playpen"));
+}
+
+#[test]
+fn harness_flag_selects_and_validates() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
+
+    // rejected before any engine work: no run, no build
+    let out = f.run(&["--harness", "bogus"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: unknown harness 'bogus' (available: omp)"));
+    assert!(f.argv().is_empty());
+    assert!(f.builds().is_empty());
+
+    let out = f.run(&["--harness", "omp"]);
+    f.assert_ok(&out);
+    assert!(f.argv().contains(&"playpen-base:omp".to_string()));
+}
+
+#[test]
+fn harness_conf_selects_and_flag_overrides_it() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
+
+    // a broken selection is fatal, with the file it came from
+    f.harness_conf("HARNESS=bogus\n");
+    let out = f.run(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f.stderr(&out).contains(
+        "playpen: unknown harness 'bogus' in"
+    ));
+    assert!(f.stderr(&out).contains("harness.conf"));
+
+    // ... and the flag wins over the conf
+    let out = f.run(&["--harness", "omp"]);
+    f.assert_ok(&out);
+    assert!(f.argv().contains(&"playpen-base:omp".to_string()));
+}
+
+#[test]
+fn tagged_and_foreign_images_run_verbatim() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+
+    // an explicit tag pins the image: no layering, no build, no inspect need
+    let out = f.run(&["playpen-jvm:latest"]);
+    f.assert_ok(&out);
+    assert!(f.argv().contains(&"playpen-jvm:latest".to_string()));
+    assert!(f.builds().is_empty());
+    assert!(!f.argv().contains(&"playpen-jvm:omp".to_string()));
+
+    // foreign images are not playpen flavors
+    let out = f.run(&["alpine", "--", "sh"]);
+    f.assert_ok(&out);
+    assert!(f.argv().contains(&"alpine".to_string()));
+    assert!(f.builds().is_empty());
+}
+
+#[test]
+fn harness_menu_writes_the_selection() {
+    let f = Fixture::new();
+    f.stub_engine("podman"); // not needed, but proves the menu is engine-free
+    let out = f.run_with_stdin(&["harness"], "1\n");
+    f.assert_ok(&out);
+    assert!(
+        f.stdout(&out).contains("Available harnesses:"),
+        "menu on stdout, got:\nstdout: {}\nstderr: {}",
+        f.stdout(&out),
+        f.stderr(&out)
+    );
+    assert!(f.stdout(&out).contains("omp"));
+    assert_eq!(f.harness_conf_contents(), "HARNESS=omp\n");
+    assert!(f.stdout(&out).contains("saved to"));
+}
+
+#[test]
+fn harness_menu_preserves_other_lines_and_takes_names() {
+    let f = Fixture::new();
+    f.harness_conf("# pick once\nplaypen-jvm=vibe\n");
+    let out = f.run_with_stdin(&["harness"], "omp\n");
+    f.assert_ok(&out);
+    let conf = f.harness_conf_contents();
+    assert_eq!(conf, "# pick once\nplaypen-jvm=vibe\nHARNESS=omp\n");
+}
+
+#[test]
+fn harness_menu_rejects_bad_input() {
+    let f = Fixture::new();
+    let out = f.run_with_stdin(&["harness"], "7\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f.stderr(&out).contains("no harness number 7"));
+    assert_eq!(f.harness_conf_contents(), "", "nothing written");
+
+    let out = f.run_with_stdin(&["harness"], "bogus\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f.stderr(&out).contains("unknown harness 'bogus'"));
+
+    // EOF (Ctrl-D) aborts without writing
+    let out = f.run_with_stdin(&["harness"], "");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f.stderr(&out).contains("no selection - nothing written"));
+}
+
+#[test]
+fn harness_update_rebuilds_matching_images_cache_busted() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("localhost/playpen-base:omp", "2025-06-01T00:00:00Z");
+    f.image("playpen-jvm:omp", "2025-06-01T00:00:00Z");
+    f.image("playpen-jvm:latest", "2025-01-01T00:00:00Z");
+    f.image("docker.io/library/node:22", "2025-05-01T00:00:00Z");
+
+    let out = f.run(&["harness", "update"]);
+    f.assert_ok(&out);
+
+    // every playpen*:<selected harness> image, nothing else
+    let builds = f.builds();
+    assert_eq!(builds.len(), 2, "two updates: {builds:?}");
+    // update rebuilds in listing order, cache-busted
+    let targets: Vec<&str> = builds.iter().map(|(argv, _)| argv[3].as_str()).collect();
+    assert_eq!(
+        targets,
+        vec!["localhost/playpen-base:omp", "playpen-jvm:omp"],
+        "{builds:?}"
+    );
+    for (argv, recipe) in &builds {
+        assert_eq!(argv[0], "build");
+        assert_eq!(argv[1], "--no-cache", "update is cache-busted: {argv:?}");
+        let target = argv[3].as_str();
+        let (repo, tag) = target.rsplit_once(':').expect("listing prints repo:tag");
+        assert_eq!(tag, "omp");
+        assert!(
+            recipe.contains(&format!("FROM {repo}:latest")),
+            "{target} builds from {repo}:latest: {recipe}"
+        );
+    }
+    assert!(f.stderr(&out).contains("playpen: updating playpen-jvm:omp"));
+    assert!(f.stderr(&out).contains("playpen: updating localhost/playpen-base:omp"));
+}
+
+#[test]
+fn harness_update_without_matching_images_is_a_no_op() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-jvm:latest", "2025-01-01T00:00:00Z");
+    f.image("docker.io/library/node:22", "2025-05-01T00:00:00Z");
+
+    let out = f.run(&["harness", "update"]);
+    f.assert_ok(&out);
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: no playpen*:omp images to update"));
+    assert!(f.builds().is_empty());
+}
+
+#[test]
+fn harness_update_name_argument_and_unknowns() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-jvm:omp", "2025-06-01T00:00:00Z");
+
+    let out = f.run(&["harness", "update", "omp"]);
+    f.assert_ok(&out);
+    assert_eq!(f.builds().len(), 1);
+    f.assert_build(&f.builds()[0], "playpen-jvm:omp", &omp_recipe("playpen-jvm"));
+
+    let out = f.run(&["harness", "update", "bogus"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: unknown harness 'bogus' (available: omp)"));
 }
