@@ -53,12 +53,16 @@ case "$1" in
     ref="${@: -1}"
     while IFS=$'\t' read -r r c; do
       if [[ "$r" == "$ref" ]]; then
+        if [[ "$c" == "!"* ]]; then
+          printf '%s\n' "${c#!}" >&2
+          exit 125
+        fi
         printf '%s\n' "$c"
         exit 0
       fi
     done < "$STUB_STATE_DIR/images.txt"
-    printf 'Error: no such image: %s\n' "$ref" >&2
-    exit 1
+    printf 'Error: %s: image not known\n' "$ref" >&2
+    exit 125
     ;;
   images)
     while IFS=$'\t' read -r r _; do
@@ -433,6 +437,90 @@ fn missing_flavor_image_is_fatal_with_a_hint() {
         .stderr(&out)
         .contains("playpen: playpen-jvm:latest not found - build the flavor first (make jvm)"));
     assert!(f.builds().is_empty(), "no build without a flavor");
+    assert!(f.argv().is_empty(), "the engine must not run");
+}
+
+#[test]
+fn stale_detection_uses_subsecond_precision() {
+    // the review finding: a flavor created later within the same second
+    // must still win the comparison, not tie it
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-base:latest", "2025-10-29T12:00:00.900Z");
+    f.image("playpen-base:omp", "2025-10-29T12:00:00.100Z");
+    let out = f.run(&[]);
+    f.assert_ok(&out);
+    assert_eq!(f.builds().len(), 1, "the fraction decides: {:?}", f.builds());
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: rebuilding harness image playpen-base:omp (flavor image is newer)"));
+}
+
+#[test]
+fn stale_detection_normalizes_timezone_offsets() {
+    // the review finding: printed local times can look out of order while
+    // the instants are not - 01:30 -0500 (06:30Z) is later than
+    // 01:45 -0400 (05:45Z), e.g. across a DST transition
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-base:latest", "2025-11-02 01:30:00.000000000 -0500 EST");
+    f.image("playpen-base:omp", "2025-11-02 01:45:00.000000000 -0400 EDT");
+    let out = f.run(&[]);
+    f.assert_ok(&out);
+    assert_eq!(
+        f.builds().len(),
+        1,
+        "offsets are applied before comparing: {:?}",
+        f.builds()
+    );
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: rebuilding harness image playpen-base:omp (flavor image is newer)"));
+}
+
+#[test]
+fn equal_instants_do_not_rebuild() {
+    // the same instant in both engines' layouts: no rebuild
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-base:latest", "2025-10-29T12:00:00.500Z");
+    f.image("playpen-base:omp", "2025-10-29 14:00:00.500000000 +0200 CEST");
+    let out = f.run(&[]);
+    f.assert_ok(&out);
+    assert!(f.builds().is_empty(), "same instant, different layouts");
+}
+
+#[test]
+fn target_inspect_error_fails_closed_before_running() {
+    // an engine error (not "missing") on the harness image must be
+    // reported, never treated as a build-trigger or ignored
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-base:latest", "2024-01-01T00:00:00Z");
+    f.image("playpen-base:omp", "!Error: storage is broken");
+    let out = f.run(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: could not inspect playpen-base:omp: Error: storage is broken"));
+    assert!(f.argv().is_empty(), "the engine must not run");
+    assert!(f.builds().is_empty(), "no build on an unknown state");
+}
+
+#[test]
+fn flavor_inspect_error_fails_closed_not_skipped() {
+    // the review finding: the harness image exists but the flavor
+    // inspection fails for another reason - report the error instead of
+    // silently skipping the staleness check and running a stale layer
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-base:latest", "!Error: database is locked");
+    f.image("playpen-base:omp", "2025-06-01T00:00:00Z");
+    let out = f.run(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: could not inspect playpen-base:latest: Error: database is locked"));
     assert!(f.argv().is_empty(), "the engine must not run");
 }
 
@@ -858,7 +946,10 @@ case "$1" in
     exit 0
     ;;
   image)
-    if [[ "${@: -1}" == "playpen-base:omp" ]]; then exit 1; fi
+    if [[ "${@: -1}" == "playpen-base:omp" ]]; then
+      printf 'Error: playpen-base:omp: image not known\n' >&2
+      exit 125
+    fi
     printf '2024-01-01 00:00:00.000000000 +0000 UTC\n'
     exit 0
     ;;

@@ -37,10 +37,13 @@ pub fn plan(image: &str, harness: &str) -> Plan {
 
 /// Why an image's Created timestamp could not be determined.
 enum CreatedError {
-    /// The engine has no such image.
+    /// The engine reports the image as absent.
     Missing,
     /// The engine reported a timestamp we cannot parse.
     Unparseable(String),
+    /// The inspection failed for a reason other than a missing image; the
+    /// engine's stderr tells why.
+    Failed(String),
 }
 
 /// The build rules: build a missing harness image; rebuild one whose flavor
@@ -63,16 +66,22 @@ pub fn ensure(engine: Engine, flavor: &str, target: &str, harness: &Harness) {
                     "playpen: {flavor_ref} not found - skipping staleness check"
                 ),
                 Err(CreatedError::Unparseable(raw)) => unparseable(&flavor_ref, &raw),
+                Err(CreatedError::Failed(stderr)) => inspect_failed(&flavor_ref, &stderr),
             }
         }
         Err(CreatedError::Missing) => {
-            if matches!(created(engine, &flavor_ref), Err(CreatedError::Missing)) {
-                missing_flavor(&flavor_ref);
+            if let Err(err) = created(engine, &flavor_ref) {
+                match err {
+                    CreatedError::Missing => missing_flavor(&flavor_ref),
+                    CreatedError::Unparseable(raw) => unparseable(&flavor_ref, &raw),
+                    CreatedError::Failed(stderr) => inspect_failed(&flavor_ref, &stderr),
+                }
             }
             eprintln!("playpen: building harness image {target}");
             build(engine, flavor, target, harness, false);
         }
         Err(CreatedError::Unparseable(raw)) => unparseable(target, &raw),
+        Err(CreatedError::Failed(stderr)) => inspect_failed(target, &stderr),
     }
 }
 
@@ -129,49 +138,160 @@ fn list(engine: Engine) -> Vec<String> {
     }
 }
 
-/// `engine image inspect --format '{{.Created}}'` normalized to second
-/// granularity. Only ever compared against timestamps from the same engine,
-/// so the differing podman/docker layouts cannot skew the comparison.
-fn created(engine: Engine, image_ref: &str) -> Result<String, CreatedError> {
+/// `engine image inspect --format '{{.Created}}'` parsed to a comparable
+/// instant. The engine's local-time layout means a DST transition between
+/// two builds changes the offset, so comparisons must be on instants, not
+/// on the printed fields.
+fn created(engine: Engine, image_ref: &str) -> Result<Created, CreatedError> {
     let output = Command::new(engine.binary())
         .args(["image", "inspect", "--format", "{{.Created}}", image_ref])
         .output();
     match output {
         Ok(output) if output.status.success() => {
             let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            normalize_created(&raw).ok_or(CreatedError::Unparseable(raw))
+            parse_created(&raw).ok_or(CreatedError::Unparseable(raw))
         }
-        // The engine reports a missing image via a nonzero status; any other
-        // inspect failure surfaces when the build it triggers runs.
-        Ok(_) => Err(CreatedError::Missing),
+        // Exit codes do not tell missing from broken (podman uses 125 for
+        // both); the stderr wording does.
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if reports_missing_image(&stderr) {
+                Err(CreatedError::Missing)
+            } else {
+                Err(CreatedError::Failed(stderr))
+            }
+        }
         Err(err) => run_error(engine, err),
     }
 }
 
-/// Normalize an engine's `{{.Created}}` value to `YYYY-MM-DDTHH:MM:SS`:
-/// podman prints Go's time.String()
+/// An image's Created instant at the full precision engines report, with
+/// the timezone offset applied: the same instant compares equal in either
+/// engine's layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Created {
+    /// Seconds since the Unix epoch, offset applied.
+    epoch: i64,
+    /// Sub-second nanoseconds.
+    nanos: u32,
+}
+
+/// Parse an engine's `{{.Created}}` value: podman prints Go's time.String()
 /// (`2025-10-29 20:07:01.23456789 +0100 CET`), docker prints RFC 3339
-/// (`2025-10-29T19:07:01.234567890Z`). Timezone and sub-second precision
-/// are dropped: staleness compares two timestamps from the same engine, and
-/// a layer build takes far longer than a second.
-pub fn normalize_created(raw: &str) -> Option<String> {
+/// (`2025-10-29T19:07:01.234567890Z`, trailing zeros trimmed). Fractional
+/// seconds and the offset are kept, not rounded away - staleness must not
+/// skip a rebuild over a tie or reverse over a DST flip.
+fn parse_created(raw: &str) -> Option<Created> {
     let raw = raw.trim();
-    let bytes = raw.as_bytes();
-    let separator = |index: usize| matches!(index, 4 | 7 | 10 | 13 | 16);
-    if bytes.len() < 19
-        || !bytes[..19]
-            .iter()
-            .enumerate()
-            .all(|(i, b)| separator(i) || b.is_ascii_digit())
-        || (bytes[10] != b'T' && bytes[10] != b' ')
+    let b = raw.as_bytes();
+    let digits = |range: std::ops::Range<usize>| b.get(range).is_some_and(|s| s.iter().all(u8::is_ascii_digit));
+    let number = |from: usize, to: usize| raw[from..to].parse::<u32>().ok();
+    if b.len() < 19
+        || !digits(0..4) || b[4] != b'-'
+        || !digits(5..7) || b[7] != b'-'
+        || !digits(8..10)
+        || (b[10] != b'T' && b[10] != b' ')
+        || !digits(11..13) || b[13] != b':'
+        || !digits(14..16) || b[16] != b':'
+        || !digits(17..19)
     {
         return None;
     }
-    let mut normalized = String::with_capacity(19);
-    normalized.push_str(&raw[..10]);
-    normalized.push('T');
-    normalized.push_str(&raw[11..19]);
-    Some(normalized)
+    let (year, month, day) = (number(0, 4)?, number(5, 7)?, number(8, 10)?);
+    let (hour, minute, second) = (number(11, 13)?, number(14, 16)?, number(17, 19)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    // Fraction: optional, up to 9 digits (podman omits a zero fraction,
+    // RFC 3339 trims trailing zeros - pad to nanoseconds).
+    let mut i = 19;
+    let mut nanos = 0u32;
+    if b.get(i) == Some(&b'.') {
+        let start = i + 1;
+        let end = raw[start..]
+            .bytes()
+            .position(|byte| !byte.is_ascii_digit())
+            .map(|offset| start + offset)
+            .unwrap_or(raw.len());
+        if end == start || end - start > 9 {
+            return None;
+        }
+        let mut fraction = raw[start..end].to_string();
+        while fraction.len() < 9 {
+            fraction.push('0');
+        }
+        nanos = fraction.parse().ok()?;
+        i = end;
+    }
+
+    // Offset: Z, or +HHMM (podman) or +HH:MM (RFC 3339); podman puts a space
+    // before the offset and a zone name after it - both ignored.
+    while b.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    let offset_seconds = match b.get(i) {
+        Some(b'Z') | Some(b'z') => 0,
+        Some(sign @ (b'+' | b'-')) => {
+            let negative = *sign == b'-';
+            i += 1;
+            if !digits(i..i + 2) {
+                return None;
+            }
+            let (offset_hour, offset_minute) = if digits(i + 2..i + 4) {
+                (number(i, i + 2)?, number(i + 2, i + 4)?)
+            } else if b.get(i + 2) == Some(&b':') && digits(i + 3..i + 5) {
+                (number(i, i + 2)?, number(i + 3, i + 5)?)
+            } else {
+                return None;
+            };
+            if offset_hour > 23 || offset_minute > 59 {
+                return None;
+            }
+            let seconds = (offset_hour * 3600 + offset_minute * 60) as i64;
+            if negative {
+                -seconds
+            } else {
+                seconds
+            }
+        }
+        // Both engines always print an offset; a timestamp without one is
+        // a format change to fail closed on.
+        _ => return None,
+    };
+
+    let epoch = days_from_civil(year, month, day) * 86_400
+        + (hour * 3600 + minute * 60 + second) as i64
+        - offset_seconds;
+    Some(Created { epoch, nanos })
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+/// Months count from March, so the leap day lands at the end of the
+/// counting year instead of inside it.
+fn days_from_civil(y: u32, m: u32, d: u32) -> i64 {
+    let y = i64::from(y) - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let year_of_era = y - era * 400; // [0, 399]
+    let month_from_march = if m > 2 { i64::from(m) - 3 } else { i64::from(m) + 9 };
+    let day_of_year = (153 * month_from_march + 2) / 5 + i64::from(d) - 1; // [0, 365]
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Whether inspect stderr says the image is absent rather than reporting
+/// some other failure (podman: "image not known"; docker: "No such image"
+/// / "No such object").
+fn reports_missing_image(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    ["image not known", "no such image", "no such object", "not found", "no such reference"]
+        .iter()
+        .any(|needle| stderr.contains(needle))
 }
 
 /// Build a harness layer: the recipe is written into an empty temp dir that
@@ -231,6 +351,17 @@ fn unparseable(image: &str, raw: &str) -> ! {
     ))
 }
 
+/// Report an inspection failure that is not a missing image, with the
+/// engine's own explanation.
+fn inspect_failed(image: &str, stderr: &str) -> ! {
+    let reason = if stderr.is_empty() {
+        "(no error output)"
+    } else {
+        stderr
+    };
+    signals::fail(format!("playpen: could not inspect {image}: {reason}"))
+}
+
 /// Command spawn failed (127 for a missing binary, like the bash launcher).
 fn run_error(engine: Engine, err: std::io::Error) -> ! {
     if err.kind() == std::io::ErrorKind::NotFound {
@@ -270,27 +401,108 @@ mod tests {
     }
 
     #[test]
-    fn created_timestamps_parse_in_both_engine_layouts() {
-        // docker: RFC 3339
+    fn created_parses_both_engine_layouts_as_instants() {
+        let created = |raw: &str| parse_created(raw).expect("parses");
+        // docker RFC 3339 (UTC) and podman Go format (local offset) of the
+        // same instant compare equal - including the +HH:MM offset spelling
         assert_eq!(
-            normalize_created("2025-10-29T19:07:01.234567890Z"),
-            Some("2025-10-29T19:07:01".to_string())
+            created("2025-10-29T19:07:01Z"),
+            created("2025-10-29 20:07:01 +0100 CET")
         );
-        // podman: Go time.String()
         assert_eq!(
-            normalize_created("2025-10-29 20:07:01.23456789 +0100 CET"),
-            Some("2025-10-29T20:07:01".to_string())
+            created("2025-10-29T19:07:01Z"),
+            created("2025-10-29T20:07:01+01:00")
         );
-        // second precision compares correctly across the date boundary
-        assert!(normalize_created("2025-11-02 00:00:00 +0100 CET").unwrap()
-            > normalize_created("2025-10-29T23:59:59Z").unwrap());
+        // offset applied, not just copied: 00:30 -05:00 is 05:30Z
+        assert_eq!(
+            created("2025-10-29T05:30:00Z"),
+            created("2025-10-29T00:30:00-05:00")
+        );
+        // ... and +05:00 shifts it into the previous UTC day
+        assert_eq!(
+            created("2025-10-28T19:30:00Z"),
+            created("2025-10-29T00:30:00+05:00")
+        );
 
-        assert_eq!(normalize_created(""), None);
-        assert_eq!(normalize_created("2025-10-29"), None);
-        assert_eq!(normalize_created("yesterday"), None);
-        // shape, not calendar validity: digits and separators are all we
-        // need to compare two timestamps of the same format
-        assert!(normalize_created("2025-13-45T99:99:99Z").is_some());
+        // sub-second precision survives; RFC 3339 trims trailing zeros,
+        // podman omits a zero fraction entirely
+        assert!(created("2025-10-29T12:00:00.900Z") > created("2025-10-29T12:00:00.100Z"));
+        assert_eq!(
+            created("2025-10-29T12:00:00.9Z"),
+            created("2025-10-29T12:00:00.900000000Z")
+        );
+        assert_eq!(
+            created("2025-10-29T12:00:00Z"),
+            created("2025-10-29 12:00:00 +0000 UTC")
+        );
+        // the review finding: same printed second, different fraction -
+        // across layouts: 12:00:00.900 +0100 is 11:00:00.9Z
+        assert!(
+            parse_created("2025-10-29 12:00:00.900000000 +0100 CEST")
+                > parse_created("2025-10-29T11:00:00.100Z")
+        );
+
+        // the review finding: offsets can flip the printed order - local
+        // 01:30 -0500 (06:30Z) is later than local 01:45 -0400 (05:45Z)
+        assert!(
+            created("2025-11-02 01:30:00.000000000 -0500 EST")
+                > created("2025-11-02 01:45:00.000000000 -0400 EDT")
+        );
+
+        // real podman output from this machine
+        assert!(parse_created("2026-10-29 19:32:53.017372362 +0000 UTC").is_some());
+        // the zero-value time some engines report for untagged layers
+        assert_eq!(created("0001-01-01T00:00:00Z").epoch, -62_135_596_800);
+    }
+
+    #[test]
+    fn days_from_civil_matches_known_dates() {
+        // pinned with `date -u`: epoch seconds / 86400
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(days_from_civil(2000, 2, 29), 11_016); // leap day
+        assert_eq!(days_from_civil(2026, 10, 29), 20_755);
+    }
+
+    #[test]
+    fn created_rejects_malformed_values() {
+        for raw in [
+            "",
+            "yesterday",
+            "2025-10-29",
+            "2025-10-29T19:07:01",          // no offset: format change
+            "2025-13-29T19:07:01Z",          // month out of range
+            "2025-00-29T19:07:01Z",
+            "2025-10-32T19:07:01Z",          // day out of range
+            "2025-10-29T24:07:01Z",          // hour out of range
+            "2025-10-29T19:60:01Z",
+            "2025-10-29T19:07:60Z",
+            "2025-10-29T19:07:01.Z",         // bare fraction
+            "2025-10-29T19:07:01.1234567890Z", // more than 9 fraction digits
+            "2025-10-29T19:07:01+010",       // truncated offset
+            "2025-10-29T19:07:01+2400",      // offset hour out of range
+            "2025-10-29T19:07:01+00:60",     // offset minute out of range
+            "2025/10/29T19:07:01Z",          // wrong separators
+        ] {
+            assert_eq!(parse_created(raw), None, "{raw:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn missing_image_errors_are_recognized_across_engines() {
+        // podman 5.8 (verified on this machine)
+        assert!(reports_missing_image(
+            "Error: playpen-base:omp: image not known"
+        ));
+        // docker
+        assert!(reports_missing_image(
+            "Error response from daemon: No such image: playpen-base:omp"
+        ));
+        assert!(reports_missing_image("Error: No such object: playpen-base:omp"));
+        // anything else is a real failure, not a missing image
+        assert!(!reports_missing_image("Error: database is locked"));
+        assert!(!reports_missing_image("Cannot connect to the Docker daemon"));
+        assert!(!reports_missing_image(""));
     }
 
     #[test]
