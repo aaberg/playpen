@@ -20,13 +20,13 @@ TRIPLE_DIR := $(if $(CARGO_BUILD_TARGET),$(CARGO_BUILD_TARGET)/,)
 all: base rust jvm
 
 base:
-	$(ENGINE) build -t playpen-base base/
+	$(ENGINE) build -t playpen-base -f base/Containerfile
 
 rust: base
-	$(ENGINE) build -t playpen-rust flavors/rust
+	$(ENGINE) build -t playpen-rust -f flavors/rust/Containerfile
 
 jvm: base
-	$(ENGINE) build -t playpen-jvm flavors/jvm
+	$(ENGINE) build -t playpen-jvm -f flavors/jvm/Containerfile
 
 test:
 	$(CARGO) test --manifest-path $(LAUNCHER)/Cargo.toml
