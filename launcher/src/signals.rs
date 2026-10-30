@@ -57,7 +57,9 @@ fn cleanup() {
 /// 128+signal when it was killed - what a shell would report.
 pub fn status_code(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
-    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
 /// Exit with an engine child's status code, deleting the env-file first

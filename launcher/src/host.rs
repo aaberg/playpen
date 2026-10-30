@@ -45,7 +45,9 @@ impl Host {
             data_home: nonempty_dir("XDG_DATA_HOME"),
             runtime_dir: nonempty_dir("XDG_RUNTIME_DIR").unwrap_or_else(|| PathBuf::from("/tmp")),
             workspace: pick_workspace(std::env::var_os("PWD")),
-            engine_pref: std::env::var("PLAYPEN_ENGINE").ok().filter(|v| !v.is_empty()),
+            engine_pref: std::env::var("PLAYPEN_ENGINE")
+                .ok()
+                .filter(|v| !v.is_empty()),
             registry_pref: std::env::var("PLAYPEN_REGISTRY")
                 .ok()
                 .filter(|v| !v.is_empty()),
@@ -82,7 +84,9 @@ impl Host {
 
     /// `command -v NAME`: an executable file in some PATH directory.
     pub fn find_in_path(&self, name: &str) -> bool {
-        path_dirs(&self.path).iter().any(|dir| is_executable_file(&dir.join(name)))
+        path_dirs(&self.path)
+            .iter()
+            .any(|dir| is_executable_file(&dir.join(name)))
     }
 }
 
@@ -111,7 +115,9 @@ fn home_dir() -> PathBuf {
 }
 
 fn nonempty_dir(var: &str) -> Option<PathBuf> {
-    std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The workspace: $PWD when it still names the current directory (bash
@@ -217,11 +223,7 @@ mod tests {
         // empty elements and an empty PATH mean the current directory
         assert_eq!(
             path_dirs(OsStr::new("/a::/b")),
-            vec![
-                PathBuf::from("/a"),
-                PathBuf::from("."),
-                PathBuf::from("/b")
-            ]
+            vec![PathBuf::from("/a"), PathBuf::from("."), PathBuf::from("/b")]
         );
         assert_eq!(path_dirs(OsStr::new("")), vec![PathBuf::from(".")]);
     }

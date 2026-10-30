@@ -87,9 +87,9 @@ pub fn ensure(engine: Engine, flavor: &str, target: &str, harness: &Harness, reg
                     build(engine, flavor, target, harness, false);
                 }
                 Ok(_) => {}
-                Err(CreatedError::Missing) => eprintln!(
-                    "playpen: {flavor_ref} not found - skipping staleness check"
-                ),
+                Err(CreatedError::Missing) => {
+                    eprintln!("playpen: {flavor_ref} not found - skipping staleness check")
+                }
                 Err(CreatedError::Unparseable(raw)) => unparseable(&flavor_ref, &raw),
                 Err(CreatedError::Failed(stderr)) => inspect_failed(&flavor_ref, &stderr),
             },
@@ -162,10 +162,7 @@ pub fn refresh(host: &Host, engine: Engine, name: Option<&str>) -> ! {
         .filter(|image_ref| matches_playpen_harness(image_ref, harness.name))
         .collect();
     if matching.is_empty() {
-        eprintln!(
-            "playpen: no playpen*:{} images to update",
-            harness.name
-        );
+        eprintln!("playpen: no playpen*:{} images to update", harness.name);
         std::process::exit(0);
     }
     for image_ref in matching {
@@ -188,10 +185,7 @@ pub fn update(host: &Host, engine: Engine, name: Option<&str>) -> ! {
         .filter(|image_ref| matches_playpen_harness(image_ref, harness.name))
         .collect();
     if matching.is_empty() {
-        eprintln!(
-            "playpen: no playpen*:{} images to update",
-            harness.name
-        );
+        eprintln!("playpen: no playpen*:{} images to update", harness.name);
         std::process::exit(0);
     }
     for image_ref in matching {
@@ -205,11 +199,13 @@ pub fn update(host: &Host, engine: Engine, name: Option<&str>) -> ! {
 /// `playpen*:<name>` per the roadmap. podman lists local images under
 /// `localhost/`; docker prints local repositories without a prefix.
 fn matches_playpen_harness(image_ref: &str, name: &str) -> bool {
-    image_ref
-        .rsplit_once(':')
-        .is_some_and(|(repo, tag)| {
-            tag == name && repo.strip_prefix("localhost/").unwrap_or(repo).starts_with("playpen")
-        })
+    image_ref.rsplit_once(':').is_some_and(|(repo, tag)| {
+        tag == name
+            && repo
+                .strip_prefix("localhost/")
+                .unwrap_or(repo)
+                .starts_with("playpen")
+    })
 }
 
 /// `engine images --format '{{.Repository}}:{{.Tag}}'`.
@@ -278,15 +274,22 @@ struct Created {
 fn parse_created(raw: &str) -> Option<Created> {
     let raw = raw.trim();
     let b = raw.as_bytes();
-    let digits = |range: std::ops::Range<usize>| b.get(range).is_some_and(|s| s.iter().all(u8::is_ascii_digit));
+    let digits = |range: std::ops::Range<usize>| {
+        b.get(range)
+            .is_some_and(|s| s.iter().all(u8::is_ascii_digit))
+    };
     let number = |from: usize, to: usize| raw[from..to].parse::<u32>().ok();
     if b.len() < 19
-        || !digits(0..4) || b[4] != b'-'
-        || !digits(5..7) || b[7] != b'-'
+        || !digits(0..4)
+        || b[4] != b'-'
+        || !digits(5..7)
+        || b[7] != b'-'
         || !digits(8..10)
         || (b[10] != b'T' && b[10] != b' ')
-        || !digits(11..13) || b[13] != b':'
-        || !digits(14..16) || b[16] != b':'
+        || !digits(11..13)
+        || b[13] != b':'
+        || !digits(14..16)
+        || b[16] != b':'
         || !digits(17..19)
     {
         return None;
@@ -372,7 +375,11 @@ fn days_from_civil(y: u32, m: u32, d: u32) -> i64 {
     let y = i64::from(y) - i64::from(m <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let year_of_era = y - era * 400; // [0, 399]
-    let month_from_march = if m > 2 { i64::from(m) - 3 } else { i64::from(m) + 9 };
+    let month_from_march = if m > 2 {
+        i64::from(m) - 3
+    } else {
+        i64::from(m) + 9
+    };
     let day_of_year = (153 * month_from_march + 2) / 5 + i64::from(d) - 1; // [0, 365]
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
@@ -383,9 +390,15 @@ fn days_from_civil(y: u32, m: u32, d: u32) -> i64 {
 /// / "No such object").
 fn reports_missing_image(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
-    ["image not known", "no such image", "no such object", "not found", "no such reference"]
-        .iter()
-        .any(|needle| stderr.contains(needle))
+    [
+        "image not known",
+        "no such image",
+        "no such object",
+        "not found",
+        "no such reference",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
 }
 
 /// Build a harness layer: the recipe is written into an empty temp dir that
@@ -393,8 +406,9 @@ fn reports_missing_image(stderr: &str) -> bool {
 /// failed build aborts the launch with the engine's own exit code.
 fn build(engine: Engine, flavor: &str, target: &str, harness: &Harness, no_cache: bool) {
     let recipe = harness::containerfile(flavor, harness);
-    let context = tempfile::tempdir()
-        .unwrap_or_else(|err| signals::fail(format!("playpen: could not create build context: {err}")));
+    let context = tempfile::tempdir().unwrap_or_else(|err| {
+        signals::fail(format!("playpen: could not create build context: {err}"))
+    });
     let containerfile = context.path().join("Containerfile");
     if let Err(err) = std::fs::write(&containerfile, &recipe) {
         signals::fail(format!(
@@ -412,9 +426,7 @@ fn build(engine: Engine, flavor: &str, target: &str, harness: &Harness, no_cache
     args.push(OsString::from("-f"));
     args.push(containerfile.into_os_string());
     args.push(context.path().as_os_str().to_os_string());
-    let status = Command::new(engine.binary())
-        .args(&args)
-        .status();
+    let status = Command::new(engine.binary()).args(&args).status();
     match status {
         Ok(status) if status.success() => {}
         Ok(status) => {
@@ -461,10 +473,7 @@ fn run_error(engine: Engine, err: std::io::Error) -> ! {
     if err.kind() == std::io::ErrorKind::NotFound {
         signals::fail(format!("playpen: {}: command not found", engine.binary()));
     }
-    signals::fail(format!(
-        "playpen: could not run {}: {err}",
-        engine.binary()
-    ))
+    signals::fail(format!("playpen: could not run {}: {err}", engine.binary()))
 }
 
 #[cfg(test)]
@@ -530,7 +539,10 @@ mod tests {
         // tags, registry paths and foreign names run as given
         assert!(matches!(plan("playpen-jvm:latest", "omp"), Plan::Verbatim));
         assert!(matches!(plan("playpen-jvm:omp", "omp"), Plan::Verbatim));
-        assert!(matches!(plan("docker.io/playpen-x:1", "omp"), Plan::Verbatim));
+        assert!(matches!(
+            plan("docker.io/playpen-x:1", "omp"),
+            Plan::Verbatim
+        ));
         assert!(matches!(plan("alpine", "omp"), Plan::Verbatim));
     }
 
@@ -604,19 +616,19 @@ mod tests {
             "",
             "yesterday",
             "2025-10-29",
-            "2025-10-29T19:07:01",          // no offset: format change
-            "2025-13-29T19:07:01Z",          // month out of range
+            "2025-10-29T19:07:01",  // no offset: format change
+            "2025-13-29T19:07:01Z", // month out of range
             "2025-00-29T19:07:01Z",
-            "2025-10-32T19:07:01Z",          // day out of range
-            "2025-10-29T24:07:01Z",          // hour out of range
+            "2025-10-32T19:07:01Z", // day out of range
+            "2025-10-29T24:07:01Z", // hour out of range
             "2025-10-29T19:60:01Z",
             "2025-10-29T19:07:60Z",
-            "2025-10-29T19:07:01.Z",         // bare fraction
+            "2025-10-29T19:07:01.Z",           // bare fraction
             "2025-10-29T19:07:01.1234567890Z", // more than 9 fraction digits
-            "2025-10-29T19:07:01+010",       // truncated offset
-            "2025-10-29T19:07:01+2400",      // offset hour out of range
-            "2025-10-29T19:07:01+00:60",     // offset minute out of range
-            "2025/10/29T19:07:01Z",          // wrong separators
+            "2025-10-29T19:07:01+010",         // truncated offset
+            "2025-10-29T19:07:01+2400",        // offset hour out of range
+            "2025-10-29T19:07:01+00:60",       // offset minute out of range
+            "2025/10/29T19:07:01Z",            // wrong separators
         ] {
             assert_eq!(parse_created(raw), None, "{raw:?} must not parse");
         }
@@ -632,10 +644,14 @@ mod tests {
         assert!(reports_missing_image(
             "Error response from daemon: No such image: playpen-base:omp"
         ));
-        assert!(reports_missing_image("Error: No such object: playpen-base:omp"));
+        assert!(reports_missing_image(
+            "Error: No such object: playpen-base:omp"
+        ));
         // anything else is a real failure, not a missing image
         assert!(!reports_missing_image("Error: database is locked"));
-        assert!(!reports_missing_image("Cannot connect to the Docker daemon"));
+        assert!(!reports_missing_image(
+            "Cannot connect to the Docker daemon"
+        ));
         assert!(!reports_missing_image(""));
     }
 
@@ -643,10 +659,16 @@ mod tests {
     fn update_filter_matches_playpen_harness_variants() {
         assert!(matches_playpen_harness("playpen-jvm:omp", "omp"));
         assert!(matches_playpen_harness("localhost/playpen-base:omp", "omp"));
-        assert!(matches_playpen_harness("playpen:omp", "omp"), "playpen* glob");
+        assert!(
+            matches_playpen_harness("playpen:omp", "omp"),
+            "playpen* glob"
+        );
         // wrong tag, foreign repos, malformed lines
         assert!(!matches_playpen_harness("playpen-jvm:latest", "omp"));
-        assert!(!matches_playpen_harness("docker.io/library/node:omp", "omp"));
+        assert!(!matches_playpen_harness(
+            "docker.io/library/node:omp",
+            "omp"
+        ));
         assert!(!matches_playpen_harness("myplaypen-jvm:omp", "omp"));
         assert!(!matches_playpen_harness("playpen-jvm", "omp"));
         assert!(!matches_playpen_harness("<none>:<none>", "omp"));

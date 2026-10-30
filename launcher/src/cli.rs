@@ -191,7 +191,11 @@ fn resolve(cli: Cli, host: &Host) -> Action {
                 Some(HarnessSub::Update { name }) => Action::HarnessUpdate { name },
             };
         }
-        Some(Sub::Update) => return Action::Update { harness: cli.harness },
+        Some(Sub::Update) => {
+            return Action::Update {
+                harness: cli.harness,
+            }
+        }
         None => {}
     }
     if cli.shell && !cli.command.is_empty() {
@@ -224,11 +228,7 @@ mod tests {
             .chain(args.iter().copied())
             .map(OsString::from)
             .collect();
-        normalize(&argv).map(|v| {
-            v.iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect()
-        })
+        normalize(&argv).map(|v| v.iter().map(|a| a.to_string_lossy().into_owned()).collect())
     }
 
     #[test]
@@ -271,7 +271,11 @@ mod tests {
         // bash: --keys consumes the next token sight-unseen, even `--`
         assert_eq!(
             normalize_strs(&["--keys", "--", "x"]),
-            Ok(vec!["playpen".to_string(), "--keys=--".to_string(), "x".to_string()])
+            Ok(vec![
+                "playpen".to_string(),
+                "--keys=--".to_string(),
+                "x".to_string()
+            ])
         );
         // ... so a trailing bare `--` after a keys value is still an error
         assert_eq!(
@@ -307,7 +311,10 @@ mod tests {
 
     #[test]
     fn normalize_spec_errors() {
-        assert_eq!(normalize_strs(&["--keys"]), Err("--keys needs a file argument"));
+        assert_eq!(
+            normalize_strs(&["--keys"]),
+            Err("--keys needs a file argument")
+        );
         assert_eq!(normalize_strs(&["--"]), Err("-- needs a command"));
         assert_eq!(
             normalize_strs(&["--keys", "a", "--keys"]),
