@@ -17,6 +17,8 @@ base/                playpen-base: Fedora, git, bash, node, bun, agent user
 flavors/rust/        playpen-rust: rustup toolchain, sccache, native build deps
 flavors/jvm/         playpen-jvm: JDK LTS, Maven, standalone Kotlin compiler
 launcher/            Rust launcher crate (binary: playpen)
+install.sh           curl-installer for the released musl binary
+.github/workflows    CI: multi-arch image publishing to ghcr.io + releases
 keys.conf.example    template for ~/.config/playpen/keys.conf (API keys)
 Makefile             build helpers
 ```
@@ -28,13 +30,26 @@ gives it a harness layer automatically.
 
 ## Setup
 
+Install the launcher (Linux x86_64/aarch64, static musl binary):
+
+```bash
+curl -fsSL https://github.com/aaberg/playpen/releases/latest/download/install.sh | sh
+```
+
+Flavor images are pulled from `ghcr.io/aaberg` on first use - no local
+builds needed. Building from source instead (or working on the launcher):
+
 ```bash
 # 1. Build everything (base first, then flavors)
 make all              # or individually: make base, make rust, make jvm
 
-# 2. Install the launcher (Rust binary to ~/.local/bin; needs cargo)
+# 2. Install the launcher (cargo build --release, copy to ~/.local/bin)
 make install
+```
 
+Then, once:
+
+```bash
 # 3. One-time: create the throwaway agent home
 mkdir -p ~/.local/share/playpen-home
 
@@ -55,6 +70,7 @@ playpen                 # no flavor: plain base
 playpen --host-engine playpen-rust   # trusted project: + host engine socket
 playpen --shell playpen-rust         # bash prompt in the harness image
 playpen playpen-jvm -- omp --version # any other command inside
+playpen update          # re-pull flavors from ghcr.io + rebuild layers
 ```
 
 The container command is the harness (omp, started in /workspace), so
@@ -75,6 +91,9 @@ The agent itself is a thin image layer the launcher builds and maintains:
   `<image>:<harness>` - `playpen playpen-jvm` runs `playpen-jvm:omp`.
 - A missing harness image is built on the fly (~1 min: the flavor layers
   are cached, only the harness install runs).
+- A flavor image missing locally is pulled from `ghcr.io/aaberg` and tagged
+  with its local name - then the same rules apply. Local images keep
+  working offline: a pull only happens when the flavor is absent.
 - A flavor image newer than its harness layer (after `make base` /
   `make rust` / `make jvm`) triggers a rebuild of the layer - so the agent
   environment always matches the toolchain.
@@ -82,11 +101,18 @@ The agent itself is a thin image layer the launcher builds and maintains:
   `~/.config/playpen/harness.conf`); `--harness NAME` overrides per run.
 - `playpen harness update` rebuilds every installed `playpen*:<harness>`
   image cache-busted: a fresh harness version on an untouched toolchain.
+- `playpen update` does both halves for every installed layer: re-pull the
+  flavor from the registry, then the cache-busted rebuild.
 - Escape hatch: a tagged or foreign image runs verbatim without layering -
   `playpen playpen-jvm:latest -- bash` is the raw flavor.
 
 ## Notes
 
+- Flavors are published to `ghcr.io/aaberg` as multi-arch manifests
+  (amd64/arm64; CI: `.github/workflows/images.yml`). Anonymous pulls need
+  the packages public - flip "Package visibility" once in the GitHub
+  package settings after the first push. `PLAYPEN_REGISTRY` overrides the
+  registry (a mirror, or images you pushed under another owner).
 - The base image is `fedora-minimal` (`ARG FEDORA_VERSION` in
   `base/Containerfile`); bump it and `make base` to move to a newer release.
   It carries no harness anymore - the launcher layers omp (and later

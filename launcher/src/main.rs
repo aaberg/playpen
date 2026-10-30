@@ -1,6 +1,7 @@
 //! playpen: launch an AI coding agent inside a sandboxed container.
 //! Phase 1 ported the bash launcher at exact parity; phase 2 makes the
-//! launcher the orchestrator of the harness layers (see ROADMAP.md).
+//! launcher the orchestrator of the harness layers; phase 3 adds pulling
+//! flavor images from the registry when missing locally (see ROADMAP.md).
 
 mod argv;
 mod cli;
@@ -26,6 +27,9 @@ fn main() -> ExitCode {
         Action::HarnessUpdate { name } => {
             images::update(&host, engine::select(&host), name.as_deref())
         }
+        Action::Update { harness } => {
+            images::refresh(&host, engine::select(&host), harness.as_deref())
+        }
         Action::Run(config) => run(&host, config),
     }
 }
@@ -41,7 +45,7 @@ fn run(host: &Host, config: Config) -> ExitCode {
 
     let image = match plan {
         images::Plan::Layered { flavor, target } => {
-            images::ensure(engine, &flavor, &target, harness);
+            images::ensure(engine, &flavor, &target, harness, images::registry(host));
             target
         }
         images::Plan::Verbatim => config.image.clone(),
@@ -108,7 +112,10 @@ fn ensure_agent_home(host: &Host) -> PathBuf {
     let dir = host.agent_home_dir();
     if !dir.is_dir() {
         if let Err(err) = std::fs::create_dir_all(&dir) {
-            signals::fail(format!("playpen: could not create {}: {err}", dir.display()));
+            signals::fail(format!(
+                "playpen: could not create {}: {err}",
+                dir.display()
+            ));
         }
         eprintln!("playpen: created {}", dir.display());
     }

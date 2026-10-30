@@ -76,9 +76,7 @@ pub fn conf_harness(host: &Host) -> Option<String> {
     let content = match std::fs::read_to_string(&file) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(err) => {
-            signals::fail(format!("playpen: could not read {}: {err}", file.display()))
-        }
+        Err(err) => signals::fail(format!("playpen: could not read {}: {err}", file.display())),
     };
     content.lines().find_map(|line| {
         if line.trim_start().starts_with('#') {
@@ -108,7 +106,9 @@ pub fn write_conf(host: &Host, name: &str) -> std::io::Result<()> {
             let mut replaced = false;
             for line in content.lines() {
                 let is_selection = !line.trim_start().starts_with('#')
-                    && line.split_once('=').is_some_and(|(key, _)| key.trim() == "HARNESS");
+                    && line
+                        .split_once('=')
+                        .is_some_and(|(key, _)| key.trim() == "HARNESS");
                 if is_selection && !replaced {
                     out.push_str(&selection);
                     replaced = true;
@@ -202,9 +202,7 @@ fn parse_choice(input: &str, default_index: usize) -> Result<&'static Harness, S
         return Ok(&REGISTRY[default_index]);
     }
     if let Ok(number) = input.parse::<usize>() {
-        let harness = number
-            .checked_sub(1)
-            .and_then(|index| REGISTRY.get(index));
+        let harness = number.checked_sub(1).and_then(|index| REGISTRY.get(index));
         return harness.ok_or_else(|| {
             format!(
                 "no harness number {number} (available: {available})",
@@ -212,8 +210,7 @@ fn parse_choice(input: &str, default_index: usize) -> Result<&'static Harness, S
             )
         });
     }
-    lookup(input)
-        .ok_or_else(|| format!("unknown harness '{input}' (available: {})", available()))
+    lookup(input).ok_or_else(|| format!("unknown harness '{input}' (available: {})", available()))
 }
 
 #[cfg(test)]
@@ -232,6 +229,7 @@ mod tests {
             runtime_dir: PathBuf::from("/run/user/1000"),
             workspace: PathBuf::from("/work"),
             engine_pref: None,
+            registry_pref: None,
             host_engine_env: false,
             path: Default::default(),
         }
@@ -260,7 +258,11 @@ mod tests {
     fn resolve_flag_conf_and_default() {
         let host = host();
         assert_eq!(resolve(&host, Some("omp")).name, "omp");
-        assert_eq!(resolve(&host, None).name, "omp", "no conf: registry default");
+        assert_eq!(
+            resolve(&host, None).name,
+            "omp",
+            "no conf: registry default"
+        );
     }
 
     #[test]

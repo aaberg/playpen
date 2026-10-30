@@ -28,11 +28,9 @@ pub fn select(host: &Host) -> Engine {
     match host.engine_pref.as_deref() {
         Some("podman") => Engine::Podman,
         Some("docker") => Engine::Docker,
-        Some(other) => {
-            signals::fail(format!(
-                "playpen: unknown engine: {other} (expected podman or docker)"
-            ))
-        }
+        Some(other) => signals::fail(format!(
+            "playpen: unknown engine: {other} (expected podman or docker)"
+        )),
         None => {
             if host.find_in_path("podman") {
                 Engine::Podman
@@ -113,7 +111,9 @@ pub fn host_engine_args(engine: Engine, socket: &Path) -> Vec<OsString> {
     ];
     if engine == Engine::Podman {
         args.push(OsString::from("-e"));
-        args.push(OsString::from("CONTAINER_HOST=unix:///run/host-engine.sock"));
+        args.push(OsString::from(
+            "CONTAINER_HOST=unix:///run/host-engine.sock",
+        ));
     }
     args
 }
@@ -145,7 +145,10 @@ mod tests {
 
     #[test]
     fn host_engine_args_mount_and_env() {
-        let podman = host_engine_args(Engine::Podman, Path::new("/run/user/1000/podman/podman.sock"));
+        let podman = host_engine_args(
+            Engine::Podman,
+            Path::new("/run/user/1000/podman/podman.sock"),
+        );
         assert_eq!(
             podman,
             vec![

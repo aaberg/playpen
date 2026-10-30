@@ -40,7 +40,10 @@ pub fn load(config: &Config, host: &Host) -> Option<EnvFile> {
     let keys_file = &config.keys_file;
     if !keys_file.is_file() {
         if config.keys_explicit {
-            signals::fail(format!("playpen: keys file not found: {}", keys_file.display()));
+            signals::fail(format!(
+                "playpen: keys file not found: {}",
+                keys_file.display()
+            ));
         }
         eprintln!(
             "playpen: {} not found - launching without API keys",
@@ -175,9 +178,7 @@ fn resolve_op(reference: &[u8]) -> Option<Vec<u8>> {
 fn tighten_permissions(keys_file: &Path) {
     if let Ok(meta) = fs::metadata(keys_file) {
         if meta.permissions().mode() & 0o077 != 0 {
-            if let Err(err) =
-                fs::set_permissions(keys_file, fs::Permissions::from_mode(0o600))
-            {
+            if let Err(err) = fs::set_permissions(keys_file, fs::Permissions::from_mode(0o600)) {
                 signals::fail(format!(
                     "playpen: could not tighten {}: {err}",
                     keys_file.display()
@@ -254,7 +255,10 @@ mod tests {
     fn op_references_are_kept_verbatim_for_resolution() {
         assert_eq!(
             parse_str("MISTRAL_API_KEY=op://Private/Mistral API Key/credential\n"),
-            vec![entry("MISTRAL_API_KEY", "op://Private/Mistral API Key/credential")]
+            vec![entry(
+                "MISTRAL_API_KEY",
+                "op://Private/Mistral API Key/credential"
+            )]
         );
     }
 

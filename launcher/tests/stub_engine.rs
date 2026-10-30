@@ -5,9 +5,11 @@
 //! Every test runs in an isolated fixture (HOME, XDG dirs, workspace) with a
 //! scrubbed environment, so results do not depend on the host's podman,
 //! docker, op or ~/.config. The stub engine also fakes the image commands
-//! phase 2 added: `image inspect --format {{.Created}}` and `images` read a
-//! state file of `ref<TAB>created` lines, and `build` records its argv plus
-//! the Containerfile it was handed.
+//! phases 2-3 added: `image inspect --format {{.Created}}` and `images` read
+//! a state file of `ref<TAB>created` lines, `build` records its argv plus
+//! the Containerfile it was handed, and `pull`/`tag` (phase 3) record their
+//! argv and read a separate registry state file - seeding a ref there makes
+//! `pull` fetch it, an empty registry fails like an unreachable one.
 
 use std::fs;
 use std::io::Write;
@@ -21,8 +23,11 @@ const PLAYPEN_BIN: &str = env!("CARGO_BIN_EXE_playpen");
 /// contents of any --env-file, then exits with $STUB_EXIT (or dies by
 /// $STUB_SIGNAL so the launcher sees a signaled child). `build` records its
 /// argv plus the recipe from the context dir. `image inspect` and `images`
-/// read $STUB_STATE_DIR/images.txt. Builtins only: PATH in tests contains
-/// just this stub.
+/// read $STUB_STATE_DIR/images.txt. `pull` fetches from
+/// $STUB_STATE_DIR/registry.txt (a `!`-prefixed created injects stderr and
+/// exits 125); `tag` copies an image entry to a new ref. `pull` and `tag`
+/// record their argv in $STUB_PULLS_FILE. Builtins only: PATH in tests
+/// contains just this stub.
 const ENGINE_STUB: &str = r#"#!/bin/bash
 case "$1" in
   run)
@@ -48,6 +53,38 @@ case "$1" in
       printf '%s\0' "END"
     } >> "$STUB_BUILDS_FILE"
     exit 0
+    ;;
+  pull)
+    {
+      printf '%s\0' "$@"
+      printf '%s\0' "END"
+    } >> "$STUB_PULLS_FILE"
+    while IFS=$'\t' read -r r c; do
+      if [[ "$r" == "$2" ]]; then
+        if [[ "$c" == "!"* ]]; then
+          printf '%s\n' "${c#!}" >&2
+          exit 125
+        fi
+        printf '%s\t%s\n' "$r" "$c" >> "$STUB_STATE_DIR/images.txt"
+        exit 0
+      fi
+    done < "$STUB_STATE_DIR/registry.txt"
+    printf 'Error: %s: not found in the stub registry\n' "$2" >&2
+    exit 125
+    ;;
+  tag)
+    {
+      printf '%s\0' "$@"
+      printf '%s\0' "END"
+    } >> "$STUB_PULLS_FILE"
+    while IFS=$'\t' read -r r c; do
+      if [[ "$r" == "$2" ]]; then
+        printf '%s\t%s\n' "$3" "$c" >> "$STUB_STATE_DIR/images.txt"
+        exit 0
+      fi
+    done < "$STUB_STATE_DIR/images.txt"
+    printf 'Error: %s: image not known\n' "$2" >&2
+    exit 125
     ;;
   image)
     ref="${@: -1}"
@@ -100,6 +137,7 @@ struct Fixture {
     state: PathBuf,
     args_file: PathBuf,
     builds_file: PathBuf,
+    pulls_file: PathBuf,
     env_file: PathBuf,
 }
 
@@ -116,6 +154,7 @@ impl Fixture {
             state: dir.path().join("state"),
             args_file: dir.path().join("stub-args"),
             builds_file: dir.path().join("stub-builds"),
+            pulls_file: dir.path().join("stub-pulls"),
             env_file: dir.path().join("stub-env"),
             _dir: dir,
         };
@@ -131,6 +170,7 @@ impl Fixture {
             fs::create_dir_all(dir).unwrap();
         }
         fs::write(fixture.state.join("images.txt"), "").unwrap();
+        fs::write(fixture.state.join("registry.txt"), "").unwrap();
         fixture
     }
 
@@ -156,6 +196,17 @@ impl Fixture {
         let mut file = fs::OpenOptions::new()
             .append(true)
             .open(self.state.join("images.txt"))
+            .unwrap();
+        file.write_all(line.as_bytes()).unwrap();
+    }
+
+    /// Seed an image in the stub registry: `pull <ref>` fetches it (a `!`
+    /// prefix makes the pull fail with that text as the engine's stderr).
+    fn seed_registry(&self, image_ref: &str, created: &str) {
+        let line = format!("{image_ref}\t{created}\n");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(self.state.join("registry.txt"))
             .unwrap();
         file.write_all(line.as_bytes()).unwrap();
     }
@@ -194,6 +245,7 @@ impl Fixture {
         cmd.env("STUB_ARGS_FILE", &self.args_file);
         cmd.env("STUB_ENV_FILE", &self.env_file);
         cmd.env("STUB_BUILDS_FILE", &self.builds_file);
+        cmd.env("STUB_PULLS_FILE", &self.pulls_file);
         cmd.env("STUB_STATE_DIR", &self.state);
         cmd.current_dir(&self.work);
         cmd.args(args);
@@ -266,6 +318,25 @@ impl Fixture {
         builds
     }
 
+    /// The recorded `pull`/`tag` invocations: argv per call.
+    fn pulls(&self) -> Vec<Vec<String>> {
+        let bytes = fs::read(&self.pulls_file).unwrap_or_default();
+        let chunks: Vec<&[u8]> = bytes
+            .split(|b| *b == 0)
+            .filter(|chunk| !chunk.is_empty())
+            .collect();
+        let mut calls = Vec::new();
+        let mut argv = Vec::new();
+        for chunk in chunks {
+            if chunk == b"END" {
+                calls.push(std::mem::take(&mut argv));
+            } else {
+                argv.push(String::from_utf8_lossy(chunk).into_owned());
+            }
+        }
+        calls
+    }
+
     /// Contents of the env-file the engine received, or "" when none.
     fn env_file_contents(&self) -> String {
         fs::read_to_string(&self.env_file).unwrap_or_default()
@@ -318,7 +389,10 @@ impl Fixture {
             file.starts_with(&format!("{context}/")),
             "-f file lives in the context: {file}"
         );
-        assert!(file.ends_with("/Containerfile"), "-f names the recipe: {file}");
+        assert!(
+            file.ends_with("/Containerfile"),
+            "-f names the recipe: {file}"
+        );
         assert_eq!(recorded_recipe, recipe);
     }
 }
@@ -359,7 +433,8 @@ fn default_run_builds_harness_then_runs_omp() {
     assert_eq!(builds.len(), 1, "one build: {builds:?}");
     f.assert_build(&builds[0], "playpen-base:omp", &omp_recipe("playpen-base"));
     assert!(
-        f.stderr(&out).contains("playpen: building harness image playpen-base:omp"),
+        f.stderr(&out)
+            .contains("playpen: building harness image playpen-base:omp"),
         "the build is announced: {}",
         f.stderr(&out)
     );
@@ -407,7 +482,10 @@ fn stale_harness_image_is_rebuilt() {
     // podman-format Created values prove the other timestamp layout parses
     let f = Fixture::new();
     f.stub_engine("podman");
-    f.image("playpen-jvm:latest", "2025-11-02 10:00:00.000000000 +0100 CET");
+    f.image(
+        "playpen-jvm:latest",
+        "2025-11-02 10:00:00.000000000 +0100 CET",
+    );
     f.image("playpen-jvm:omp", "2025-11-01 09:00:00.000000000 +0100 CET");
     let out = f.run(&["playpen-jvm"]);
     f.assert_ok(&out);
@@ -428,16 +506,168 @@ fn stale_harness_image_is_rebuilt() {
 }
 
 #[test]
-fn missing_flavor_image_is_fatal_with_a_hint() {
+fn missing_flavor_is_fatal_after_a_failed_pull() {
     let f = Fixture::new();
     f.stub_engine("podman");
+    // nothing locally, nothing in the stub registry: the pull fails and
+    // the make hint is the way out
+    let out = f.run(&["playpen-jvm"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f.stderr(&out).contains(
+        "playpen: playpen-jvm:latest not found - pulling ghcr.io/aaberg/playpen-jvm:latest"
+    ));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: pull of ghcr.io/aaberg/playpen-jvm:latest failed"));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: playpen-jvm:latest not found - build the flavor first (make jvm)"));
+    assert_eq!(
+        f.pulls(),
+        vec![vec![
+            "pull".to_string(),
+            "ghcr.io/aaberg/playpen-jvm:latest".to_string()
+        ]],
+        "one pull attempt, then the tag is never reached"
+    );
+    assert!(f.builds().is_empty(), "no build without a flavor");
+    assert!(f.argv().is_empty(), "the engine must not run");
+}
+
+#[test]
+fn pull_engine_error_streams_and_is_fatal() {
+    // a registry that answers with an error (auth, rate limit): the
+    // engine's own message stays visible and the pull reason is reported
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.seed_registry(
+        "ghcr.io/aaberg/playpen-jvm:latest",
+        "!Error: unauthorized: authentication required",
+    );
     let out = f.run(&["playpen-jvm"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(f
         .stderr(&out)
-        .contains("playpen: playpen-jvm:latest not found - build the flavor first (make jvm)"));
-    assert!(f.builds().is_empty(), "no build without a flavor");
+        .contains("Error: unauthorized: authentication required"));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: pull of ghcr.io/aaberg/playpen-jvm:latest failed"));
     assert!(f.argv().is_empty(), "the engine must not run");
+}
+
+#[test]
+fn missing_flavor_is_pulled_from_the_registry_then_layered() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.seed_registry("ghcr.io/aaberg/playpen-jvm:latest", "2025-05-01T00:00:00Z");
+    let out = f.run(&["playpen-jvm"]);
+    f.assert_ok(&out);
+
+    // pull, tag under the local name, then the ordinary build rules
+    let calls = f.pulls();
+    assert_eq!(calls.len(), 2, "pull + tag: {calls:?}");
+    assert_eq!(
+        calls[0],
+        vec![
+            "pull".to_string(),
+            "ghcr.io/aaberg/playpen-jvm:latest".to_string()
+        ]
+    );
+    assert_eq!(
+        calls[1],
+        vec![
+            "tag".to_string(),
+            "ghcr.io/aaberg/playpen-jvm:latest".to_string(),
+            "playpen-jvm:latest".to_string()
+        ]
+    );
+    assert!(f.stderr(&out).contains(
+        "playpen: playpen-jvm:latest not found - pulling ghcr.io/aaberg/playpen-jvm:latest"
+    ));
+
+    let builds = f.builds();
+    assert_eq!(
+        builds.len(),
+        1,
+        "the layer builds on the pulled flavor: {builds:?}"
+    );
+    f.assert_build(&builds[0], "playpen-jvm:omp", &omp_recipe("playpen-jvm"));
+    assert!(f.argv().contains(&"playpen-jvm:omp".to_string()));
+}
+
+#[test]
+fn no_pull_when_the_flavor_exists_locally() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.seed_fresh("playpen-base");
+    // a registry image newer than everything: must not tempt a pull
+    f.seed_registry("ghcr.io/aaberg/playpen-base:latest", "2025-11-01T00:00:00Z");
+    let out = f.run(&[]);
+    f.assert_ok(&out);
+    assert!(
+        f.pulls().is_empty(),
+        "a pull only happens when the image is absent"
+    );
+    assert!(f.builds().is_empty(), "fresh layer, nothing to rebuild");
+}
+
+#[test]
+fn existing_layer_runs_offline_when_the_pull_fails() {
+    // the roadmap's local-first rule: the layer exists, the flavor does
+    // not, the registry is unreachable - the run proceeds without the
+    // staleness check
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-base:omp", "2025-06-01T00:00:00Z");
+    let out = f.run(&[]);
+    f.assert_ok(&out);
+    assert!(f.stderr(&out).contains(
+        "playpen: skipping staleness check (pull of ghcr.io/aaberg/playpen-base:latest failed)"
+    ));
+    assert!(f.builds().is_empty(), "nothing to rebuild a layer from");
+    assert!(f.argv().contains(&"playpen-base:omp".to_string()));
+}
+
+#[test]
+fn pulled_flavor_newer_than_the_layer_rebuilds_it() {
+    // a successful pull restores the staleness rules: the registry's
+    // flavor is newer than the layer, so the layer rebuilds
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-jvm:omp", "2025-06-01T00:00:00Z");
+    f.seed_registry("ghcr.io/aaberg/playpen-jvm:latest", "2025-11-01T00:00:00Z");
+    let out = f.run(&["playpen-jvm"]);
+    f.assert_ok(&out);
+    assert_eq!(
+        f.builds().len(),
+        1,
+        "the freshly pulled flavor is newer: {:?}",
+        f.builds()
+    );
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: rebuilding harness image playpen-jvm:omp (flavor image is newer)"));
+    assert!(f.argv().contains(&"playpen-jvm:omp".to_string()));
+}
+
+#[test]
+fn registry_override_changes_the_pull_source() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.seed_registry(
+        "registry.local:5000/acme/playpen-base:latest",
+        "2024-01-01T00:00:00Z",
+    );
+    let out = f.run_with(&[], &[("PLAYPEN_REGISTRY", "registry.local:5000/acme")]);
+    f.assert_ok(&out);
+    assert_eq!(
+        f.pulls()[0],
+        vec![
+            "pull".to_string(),
+            "registry.local:5000/acme/playpen-base:latest".to_string()
+        ]
+    );
+    assert!(f.argv().contains(&"playpen-base:omp".to_string()));
 }
 
 #[test]
@@ -450,7 +680,12 @@ fn stale_detection_uses_subsecond_precision() {
     f.image("playpen-base:omp", "2025-10-29T12:00:00.100Z");
     let out = f.run(&[]);
     f.assert_ok(&out);
-    assert_eq!(f.builds().len(), 1, "the fraction decides: {:?}", f.builds());
+    assert_eq!(
+        f.builds().len(),
+        1,
+        "the fraction decides: {:?}",
+        f.builds()
+    );
     assert!(f
         .stderr(&out)
         .contains("playpen: rebuilding harness image playpen-base:omp (flavor image is newer)"));
@@ -463,8 +698,14 @@ fn stale_detection_normalizes_timezone_offsets() {
     // 01:45 -0400 (05:45Z), e.g. across a DST transition
     let f = Fixture::new();
     f.stub_engine("podman");
-    f.image("playpen-base:latest", "2025-11-02 01:30:00.000000000 -0500 EST");
-    f.image("playpen-base:omp", "2025-11-02 01:45:00.000000000 -0400 EDT");
+    f.image(
+        "playpen-base:latest",
+        "2025-11-02 01:30:00.000000000 -0500 EST",
+    );
+    f.image(
+        "playpen-base:omp",
+        "2025-11-02 01:45:00.000000000 -0400 EDT",
+    );
     let out = f.run(&[]);
     f.assert_ok(&out);
     assert_eq!(
@@ -484,7 +725,10 @@ fn equal_instants_do_not_rebuild() {
     let f = Fixture::new();
     f.stub_engine("podman");
     f.image("playpen-base:latest", "2025-10-29T12:00:00.500Z");
-    f.image("playpen-base:omp", "2025-10-29 14:00:00.500000000 +0200 CEST");
+    f.image(
+        "playpen-base:omp",
+        "2025-10-29 14:00:00.500000000 +0200 CEST",
+    );
     let out = f.run(&[]);
     f.assert_ok(&out);
     assert!(f.builds().is_empty(), "same instant, different layouts");
@@ -537,7 +781,11 @@ fn shell_mode_runs_bash() {
         .position(|a| a == "playpen-base:omp")
         .expect("harness image");
     assert_eq!(&argv[pos + 1..], &["/bin/bash".to_string()]);
-    assert_eq!(argv.len(), pos + 2, "bash is the only command word: {argv:?}");
+    assert_eq!(
+        argv.len(),
+        pos + 2,
+        "bash is the only command word: {argv:?}"
+    );
 }
 
 #[test]
@@ -550,8 +798,14 @@ fn passthrough_command_wins_and_keeps_flags() {
     let out = f.run(&["playpen-jvm", "--", "omp", "--version"]);
     f.assert_ok(&out);
     let argv = f.argv();
-    let pos = argv.iter().position(|a| a == "playpen-jvm:omp").expect("image");
-    assert_eq!(&argv[pos + 1..], &["omp".to_string(), "--version".to_string()]);
+    let pos = argv
+        .iter()
+        .position(|a| a == "playpen-jvm:omp")
+        .expect("image");
+    assert_eq!(
+        &argv[pos + 1..],
+        &["omp".to_string(), "--version".to_string()]
+    );
 
     // flag-like words and further `--` stay verbatim
     let out = f.run(&["--", "bash", "-c", "true", "--tail"]);
@@ -607,16 +861,23 @@ fn cargo_volume_only_for_rust_images() {
         .iter()
         .position(|a| a == "playpen-rust:omp")
         .expect("image");
-    assert!(home < cargo && cargo < image, "volume sits between home and image");
+    assert!(
+        home < cargo && cargo < image,
+        "volume sits between home and image"
+    );
 
     let out = f.run(&["playpen-base"]);
     f.assert_ok(&out);
-    assert!(!f.argv().contains(&"playpen-cargo:/opt/agent-cargo".to_string()));
+    assert!(!f
+        .argv()
+        .contains(&"playpen-cargo:/opt/agent-cargo".to_string()));
 
     // bash glob `playpen-rust*`: a longer rust-ish image also gets it
     let out = f.run(&["playpen-rust-nightly"]);
     f.assert_ok(&out);
-    assert!(f.argv().contains(&"playpen-cargo:/opt/agent-cargo".to_string()));
+    assert!(f
+        .argv()
+        .contains(&"playpen-cargo:/opt/agent-cargo".to_string()));
 }
 
 #[test]
@@ -635,7 +896,9 @@ fn docker_runs_as_invoking_user() {
         .expect("docker gets --user");
     assert_eq!(
         user,
-        format!("{}:{}", unsafe { libc::getuid() }, unsafe { libc::getgid() })
+        format!("{}:{}", unsafe { libc::getuid() }, unsafe {
+            libc::getgid()
+        })
     );
     assert!(!argv.iter().any(|a| a == "--userns=keep-id"));
 }
@@ -664,7 +927,9 @@ fn no_engine_found_is_fatal() {
     let f = Fixture::new();
     let out = f.run(&[]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(f.stderr(&out).contains("neither podman nor docker found in PATH"));
+    assert!(f
+        .stderr(&out)
+        .contains("neither podman nor docker found in PATH"));
 }
 
 #[test]
@@ -713,7 +978,10 @@ fn keys_lifecycle_literal_and_op_reference() {
         "MISTRAL_API_KEY=literal-key\nOPENAI_API_KEY=resolved-secret-value\n"
     );
     // the temp env-file is removed when the launcher exits
-    assert!(f.leftover_env_files().is_empty(), "no playpen-env.* left behind");
+    assert!(
+        f.leftover_env_files().is_empty(),
+        "no playpen-env.* left behind"
+    );
 }
 
 #[test]
@@ -750,10 +1018,7 @@ fn keys_op_failure_aborts_launch() {
     let f = Fixture::new();
     f.stub_engine("podman");
     f.seed_fresh("playpen-base");
-    write_exec(
-        &f.bin.join("op"),
-        "#!/bin/bash\necho nope >&2\nexit 1\n",
-    );
+    write_exec(&f.bin.join("op"), "#!/bin/bash\necho nope >&2\nexit 1\n");
     f.keys_conf("OPKEY=op://Private/x/y\n");
     let out = f.run(&[]);
     assert_eq!(out.status.code(), Some(1));
@@ -885,20 +1150,39 @@ fn host_engine_via_environment_variable() {
     let listener = std::os::unix::net::UnixListener::bind(sock_dir.join("docker.sock")).unwrap();
 
     // 1/true/yes enable, like the bash regex ^(1|true|yes)$
-    let out = f.run_with(&[], &[("PLAYPEN_HOST_ENGINE", "1"), ("PLAYPEN_ENGINE", "docker")]);
+    let out = f.run_with(
+        &[],
+        &[("PLAYPEN_HOST_ENGINE", "1"), ("PLAYPEN_ENGINE", "docker")],
+    );
     f.assert_ok(&out);
-    assert!(f.argv().contains(&"DOCKER_HOST=unix:///run/host-engine.sock".to_string()));
+    assert!(f
+        .argv()
+        .contains(&"DOCKER_HOST=unix:///run/host-engine.sock".to_string()));
 
-    let out = f.run_with(&[], &[("PLAYPEN_HOST_ENGINE", "yes"), ("PLAYPEN_ENGINE", "docker")]);
+    let out = f.run_with(
+        &[],
+        &[("PLAYPEN_HOST_ENGINE", "yes"), ("PLAYPEN_ENGINE", "docker")],
+    );
     f.assert_ok(&out);
-    assert!(f.argv().contains(&"DOCKER_HOST=unix:///run/host-engine.sock".to_string()));
+    assert!(f
+        .argv()
+        .contains(&"DOCKER_HOST=unix:///run/host-engine.sock".to_string()));
 
     // anything else leaves it off
-    let out = f.run_with(&[], &[("PLAYPEN_HOST_ENGINE", "0"), ("PLAYPEN_ENGINE", "docker")]);
+    let out = f.run_with(
+        &[],
+        &[("PLAYPEN_HOST_ENGINE", "0"), ("PLAYPEN_ENGINE", "docker")],
+    );
     f.assert_ok(&out);
     assert!(!f.argv().iter().any(|a| a.starts_with("DOCKER_HOST")));
 
-    let out = f.run_with(&[], &[("PLAYPEN_HOST_ENGINE", "sure"), ("PLAYPEN_ENGINE", "docker")]);
+    let out = f.run_with(
+        &[],
+        &[
+            ("PLAYPEN_HOST_ENGINE", "sure"),
+            ("PLAYPEN_ENGINE", "docker"),
+        ],
+    );
     f.assert_ok(&out);
     assert!(!f.argv().iter().any(|a| a.starts_with("DOCKER_HOST")));
     drop(listener);
@@ -981,7 +1265,10 @@ fn keys_flag_after_separator_is_a_passthrough() {
         .iter()
         .position(|a| a == "playpen-base:omp")
         .expect("default image");
-    assert_eq!(&argv[pos + 1..], &["echo".to_string(), "--keys".to_string()]);
+    assert_eq!(
+        &argv[pos + 1..],
+        &["echo".to_string(), "--keys".to_string()]
+    );
 }
 
 #[test]
@@ -1037,7 +1324,10 @@ fn help_and_version_print_and_exit_zero() {
     let stdout = f.stdout(&out);
     assert!(stdout.contains("playpen"));
     assert!(stdout.contains("PLAYPEN_ENGINE"));
-    assert!(stdout.contains("harness"), "help mentions the harness layering");
+    assert!(
+        stdout.contains("harness"),
+        "help mentions the harness layering"
+    );
 
     let out = f.run(&["--version"]);
     assert_eq!(out.status.code(), Some(0));
@@ -1074,9 +1364,9 @@ fn harness_conf_selects_and_flag_overrides_it() {
     f.harness_conf("HARNESS=bogus\n");
     let out = f.run(&[]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(f.stderr(&out).contains(
-        "playpen: unknown harness 'bogus' in"
-    ));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: unknown harness 'bogus' in"));
     assert!(f.stderr(&out).contains("harness.conf"));
 
     // ... and the flag wins over the conf
@@ -1183,7 +1473,9 @@ fn harness_update_rebuilds_matching_images_cache_busted() {
         );
     }
     assert!(f.stderr(&out).contains("playpen: updating playpen-jvm:omp"));
-    assert!(f.stderr(&out).contains("playpen: updating localhost/playpen-base:omp"));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: updating localhost/playpen-base:omp"));
 }
 
 #[test]
@@ -1210,11 +1502,118 @@ fn harness_update_name_argument_and_unknowns() {
     let out = f.run(&["harness", "update", "omp"]);
     f.assert_ok(&out);
     assert_eq!(f.builds().len(), 1);
-    f.assert_build(&f.builds()[0], "playpen-jvm:omp", &omp_recipe("playpen-jvm"));
+    f.assert_build(
+        &f.builds()[0],
+        "playpen-jvm:omp",
+        &omp_recipe("playpen-jvm"),
+    );
 
     let out = f.run(&["harness", "update", "bogus"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(f
         .stderr(&out)
         .contains("playpen: unknown harness 'bogus' (available: omp)"));
+}
+
+#[test]
+fn update_repulls_flavors_and_rebuilds_layers() {
+    // `playpen update` = refresh the flavors underneath the installed
+    // layers, then the same cache-busted rebuilds as `harness update`
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-jvm:omp", "2025-06-01T00:00:00Z");
+    f.image("playpen-jvm:latest", "2025-01-01T00:00:00Z");
+    f.image("localhost/playpen-base:omp", "2025-06-01T00:00:00Z");
+    f.seed_registry("ghcr.io/aaberg/playpen-jvm:latest", "2025-11-01T00:00:00Z");
+    f.seed_registry("ghcr.io/aaberg/playpen-base:latest", "2025-11-01T00:00:00Z");
+
+    let out = f.run(&["update"]);
+    f.assert_ok(&out);
+
+    // re-pull each flavor and tag it with its local name; localhost/ is
+    // stripped from the registry ref but kept on the local tag
+    let calls = f.pulls();
+    assert_eq!(calls.len(), 4, "pull + tag per flavor: {calls:?}");
+    assert_eq!(
+        calls[0],
+        vec![
+            "pull".to_string(),
+            "ghcr.io/aaberg/playpen-jvm:latest".to_string()
+        ]
+    );
+    assert_eq!(
+        calls[1],
+        vec![
+            "tag".to_string(),
+            "ghcr.io/aaberg/playpen-jvm:latest".to_string(),
+            "playpen-jvm:latest".to_string()
+        ]
+    );
+    assert_eq!(
+        calls[2],
+        vec![
+            "pull".to_string(),
+            "ghcr.io/aaberg/playpen-base:latest".to_string()
+        ]
+    );
+    assert_eq!(
+        calls[3],
+        vec![
+            "tag".to_string(),
+            "ghcr.io/aaberg/playpen-base:latest".to_string(),
+            "localhost/playpen-base:latest".to_string()
+        ]
+    );
+
+    let builds = f.builds();
+    assert_eq!(
+        builds.len(),
+        2,
+        "one rebuild per installed layer: {builds:?}"
+    );
+    let targets: Vec<&str> = builds.iter().map(|(argv, _)| argv[3].as_str()).collect();
+    assert_eq!(
+        targets,
+        vec!["playpen-jvm:omp", "localhost/playpen-base:omp"]
+    );
+    for (argv, _) in &builds {
+        assert_eq!(
+            argv[1], "--no-cache",
+            "update rebuilds cache-busted: {argv:?}"
+        );
+    }
+    assert!(f.stderr(&out).contains("playpen: updating playpen-jvm:omp"));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: updating localhost/playpen-base:omp"));
+}
+
+#[test]
+fn update_pull_failure_aborts_the_update() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-jvm:omp", "2025-06-01T00:00:00Z");
+    f.image("localhost/playpen-base:omp", "2025-06-01T00:00:00Z");
+    // empty stub registry: every pull fails; the first one aborts
+    let out = f.run(&["update"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: pull of ghcr.io/aaberg/playpen-jvm:latest failed"));
+    assert!(f.builds().is_empty(), "no rebuild after a failed pull");
+    assert_eq!(f.pulls().len(), 1, "the second flavor is never reached");
+}
+
+#[test]
+fn update_without_installed_layers_is_a_no_op() {
+    let f = Fixture::new();
+    f.stub_engine("podman");
+    f.image("playpen-jvm:latest", "2025-01-01T00:00:00Z");
+    let out = f.run(&["update"]);
+    f.assert_ok(&out);
+    assert!(f
+        .stderr(&out)
+        .contains("playpen: no playpen*:omp images to update"));
+    assert!(f.pulls().is_empty(), "nothing to refresh");
+    assert!(f.builds().is_empty());
 }
