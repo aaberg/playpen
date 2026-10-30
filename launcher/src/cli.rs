@@ -1,7 +1,8 @@
 //! CLI parsing. The run flags are the phase-1 spec, ported from
 //! `bin/playpen`; messages marked "spec" keep the bash launcher's exact
-//! wording. Phase 2 adds the `--harness` flag and the `harness` subcommand.
-//! Everything downstream receives a fully resolved [`Action`].
+//! wording. Phase 2 adds the `--harness` flag and the `harness` subcommand,
+//! phase 3 the `update` subcommand. Everything downstream receives a fully
+//! resolved [`Action`].
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
@@ -21,7 +22,9 @@ use crate::host::Host;
                   home that persists on the host.",
     after_help = "Environment:\n  \
         PLAYPEN_ENGINE          force the container engine: podman or docker\n  \
-        PLAYPEN_HOST_ENGINE     same as --host-engine when set to 1, true or yes\n\n\
+        PLAYPEN_HOST_ENGINE     same as --host-engine when set to 1, true or yes\n  \
+        PLAYPEN_REGISTRY        registry flavor images are pulled from when\n  \
+        \x20                       missing locally [default: ghcr.io/aaberg]\n\n\
         Keys file (override with --keys FILE):\n  \
         ~/.config/playpen/keys.conf - one NAME=value per line; a value is a literal\n  \
         or an op:// reference resolved with the 1Password CLI at launch.\n\n\
@@ -35,7 +38,8 @@ use crate::host::Host;
         playpen playpen-jvm -- omp --version     one-off command\n  \
         playpen --host-engine playpen-rust       grant host engine access\n  \
         playpen harness                          pick the default harness\n  \
-        playpen harness update                   refresh installed harnesses"
+        playpen harness update                   refresh installed harnesses\n  \
+        playpen update                           re-pull flavors + rebuild layers"
 )]
 pub struct Cli {
     /// Mount the host container engine socket (trusted projects only)
@@ -76,6 +80,8 @@ pub enum Sub {
         #[command(subcommand)]
         cmd: Option<HarnessSub>,
     },
+    /// Re-pull flavor images from the registry and rebuild harness layers
+    Update,
 }
 
 #[derive(Subcommand, Debug)]
@@ -97,6 +103,9 @@ pub enum Action {
     HarnessMenu,
     /// `playpen harness update [NAME]`.
     HarnessUpdate { name: Option<String> },
+    /// `playpen update`: re-pull flavors + rebuild harness layers. The
+    /// `--harness` flag carries the same override it does for a run.
+    Update { harness: Option<String> },
 }
 
 /// The resolved launch configuration. The container command is resolved in
@@ -175,11 +184,15 @@ fn normalize(argv: &[OsString]) -> Result<Vec<OsString>, &'static str> {
 }
 
 fn resolve(cli: Cli, host: &Host) -> Action {
-    if let Some(Sub::Harness { cmd }) = cli.sub {
-        return match cmd {
-            None => Action::HarnessMenu,
-            Some(HarnessSub::Update { name }) => Action::HarnessUpdate { name },
-        };
+    match cli.sub {
+        Some(Sub::Harness { cmd }) => {
+            return match cmd {
+                None => Action::HarnessMenu,
+                Some(HarnessSub::Update { name }) => Action::HarnessUpdate { name },
+            };
+        }
+        Some(Sub::Update) => return Action::Update { harness: cli.harness },
+        None => {}
     }
     if cli.shell && !cli.command.is_empty() {
         // spec
@@ -313,6 +326,7 @@ mod tests {
             runtime_dir: PathBuf::from("/run/user/1000"),
             workspace: PathBuf::from("/work"),
             engine_pref: None,
+            registry_pref: None,
             host_engine_env: false,
             path: Default::default(),
         }
@@ -357,6 +371,25 @@ mod tests {
         match resolve(c, &host()) {
             Action::HarnessUpdate { name } => assert_eq!(name.as_deref(), Some("omp")),
             _ => panic!("expected HarnessUpdate"),
+        }
+
+        // `playpen update` resolves to its action, with the harness override
+        let c = Cli {
+            sub: Some(Sub::Update),
+            ..cli(false, "playpen-base", vec![])
+        };
+        match resolve(c, &host()) {
+            Action::Update { harness } => assert_eq!(harness, None),
+            _ => panic!("expected Update"),
+        }
+        let c = Cli {
+            sub: Some(Sub::Update),
+            harness: Some("omp".to_string()),
+            ..cli(false, "playpen-base", vec![])
+        };
+        match resolve(c, &host()) {
+            Action::Update { harness } => assert_eq!(harness.as_deref(), Some("omp")),
+            _ => panic!("expected Update with the harness flag"),
         }
 
         assert!(matches!(

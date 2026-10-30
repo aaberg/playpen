@@ -232,6 +232,7 @@ mod tests {
             runtime_dir: PathBuf::from("/run/user/1000"),
             workspace: PathBuf::from("/work"),
             engine_pref: None,
+            registry_pref: None,
             host_engine_env: false,
             path: Default::default(),
         }

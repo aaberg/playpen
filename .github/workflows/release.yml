@@ -1,0 +1,65 @@
+# Release: build static musl binaries (amd64, arm64) on native runners,
+# publish a GitHub Release with sha256 checksums and install.sh. Push a v*
+# tag to publish; install.sh fetches releases/latest/download (ROADMAP.md
+# phase 3).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            suffix: x86_64-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            suffix: aarch64-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install musl toolchain
+        run: |
+          rustup target add ${{ matrix.target }}
+          sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build
+        # The dependency set is pure Rust; the musl targets link with the
+        # CRT objects rustc ships (self-contained), no C toolchain needed.
+        run: |
+          cargo build --release --locked --manifest-path launcher/Cargo.toml --target ${{ matrix.target }}
+          tar -czf "playpen-${{ matrix.suffix }}.tar.gz" -C "launcher/target/${{ matrix.target }}/release" playpen
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playpen-${{ matrix.suffix }}
+          path: playpen-${{ matrix.suffix }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: checksums
+        run: sha256sum playpen-*.tar.gz > SHA256SUMS
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          files="playpen-x86_64-linux-musl.tar.gz playpen-aarch64-linux-musl.tar.gz SHA256SUMS install.sh"
+          # a re-run after a partial publish uploads into the same release
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" $files --clobber
+          else
+            gh release create "$tag" --title "$tag" --generate-notes $files
+          fi

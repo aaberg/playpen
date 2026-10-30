@@ -25,6 +25,9 @@ pub struct Host {
     pub workspace: PathBuf,
     /// PLAYPEN_ENGINE (set and non-empty), podman or docker.
     pub engine_pref: Option<String>,
+    /// PLAYPEN_REGISTRY (set and non-empty): where flavor images are
+    /// pulled from when missing locally.
+    pub registry_pref: Option<String>,
     /// PLAYPEN_HOST_ENGINE matched ^(1|true|yes)$.
     pub host_engine_env: bool,
     /// $PATH.
@@ -43,6 +46,9 @@ impl Host {
             runtime_dir: nonempty_dir("XDG_RUNTIME_DIR").unwrap_or_else(|| PathBuf::from("/tmp")),
             workspace: pick_workspace(std::env::var_os("PWD")),
             engine_pref: std::env::var("PLAYPEN_ENGINE").ok().filter(|v| !v.is_empty()),
+            registry_pref: std::env::var("PLAYPEN_REGISTRY")
+                .ok()
+                .filter(|v| !v.is_empty()),
             host_engine_env: host_engine_env_value(
                 std::env::var("PLAYPEN_HOST_ENGINE").ok().as_deref(),
             ),
@@ -155,6 +161,7 @@ mod tests {
             runtime_dir: PathBuf::from("/run/user/1000"),
             workspace: PathBuf::from("/work"),
             engine_pref: None,
+            registry_pref: None,
             host_engine_env: false,
             path: OsString::from("/usr/bin:/bin"),
         }
