@@ -115,10 +115,11 @@ without rebuilding the toolchain.
 ## Phase 3 - CI publishing + installer
 
 - GitHub Actions: PR/main validation includes native amd64/arm64 launcher tests
-  and real Docker/Podman smoke of packaged musl binaries. Matching `v<version>`
-  tags publish versioned multi-arch flavor images and binary releases only
-  after consumer checks; `latest` advances only for newer stable releases.
-  Publish sha256 checksums and install.sh with the complete GitHub Release.
+  and real Docker/Podman smoke of packaged musl binaries. Manually publishing
+  a GitHub Release with a matching `v<version>` tag triggers versioned multi-arch
+  image publication and attaches binaries, sha256 checksums, and install.sh
+  after consumer checks. Container `latest` follows GitHub's current Latest
+  stable release selection, not semantic-version ordering.
 - Launcher: pull `ghcr.io/<owner>/<image>` when missing locally; local
   images keep working offline (a pull only happens when the image is
   absent).

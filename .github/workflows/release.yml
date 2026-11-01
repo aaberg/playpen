@@ -1,11 +1,11 @@
 name: release
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
-# Serialize releases, including different tags, so an older run cannot race a
-# newer run while deciding whether to advance the stable channel.
+# Serialize publication; GitHub's current Latest release controls the stable
+# image channel, not tag ordering.
 concurrency:
   group: release-publication
   cancel-in-progress: false
@@ -16,57 +16,10 @@ permissions:
 env:
   REGISTRY: ghcr.io/aaberg
   IMAGES: playpen-base playpen-rust playpen-jvm
+  TAG: ${{ github.event.release.tag_name }}
 
 jobs:
-  metadata:
-    runs-on: ubuntu-26.04
-    outputs:
-      tag: ${{ steps.release.outputs.tag }}
-      version: ${{ steps.release.outputs.version }}
-      prerelease: ${{ steps.release.outputs.prerelease }}
-      promote: ${{ steps.release.outputs.promote }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Validate release version and stable-channel ordering
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" > "$RUNNER_TEMP/releases.json"
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          import tomllib
-          from pathlib import Path
-
-          semver = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?")
-          tag = os.environ["GITHUB_REF_NAME"]
-          match = semver.fullmatch(tag)
-          if not match:
-              raise SystemExit("Release tag must be vMAJOR.MINOR.PATCH, optionally with a prerelease suffix")
-          prerelease = match[4] is not None
-          if prerelease and any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in match[4].split(".")):
-              raise SystemExit("Numeric prerelease identifiers must not have leading zeroes")
-          version = tag[1:]
-          package = tomllib.loads(Path("launcher/Cargo.toml").read_text())["package"]
-          if package["version"] != version:
-              raise SystemExit(f"Tag {tag} does not match launcher version {package['version']}")
-          releases = [release for page in json.loads((Path(os.environ["RUNNER_TEMP"]) / "releases.json").read_text()) for release in page]
-          published = [release for release in releases if not release["draft"]]
-          if any(release["tag_name"] == tag for release in published):
-              raise SystemExit(f"Release {tag} is already published; published assets and image tags are not overwritten")
-          current = tuple(int(match[i]) for i in (1, 2, 3))
-          stable = [semver.fullmatch(release["tag_name"]) for release in published if not release["prerelease"]]
-          stable = [tuple(int(item[i]) for i in (1, 2, 3)) for item in stable if item and item[4] is None]
-          promote = not prerelease and (not stable or current > max(stable))
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              for key, value in {"tag": tag, "version": version, "prerelease": str(prerelease).lower(), "promote": str(promote).lower()}.items():
-                  print(f"{key}={value}", file=output)
-          PY
-
   checks:
-    needs: metadata
     uses: ./.github/workflows/ci.yml
     with:
       skip-containers: true
@@ -74,7 +27,7 @@ jobs:
       contents: read
 
   build:
-    needs: [metadata, checks]
+    needs: checks
     strategy:
       fail-fast: false
       matrix:
@@ -93,23 +46,34 @@ jobs:
       contents: read
       packages: write
     env:
-      CANDIDATE: ${{ needs.metadata.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
-      BUILD_ARGS: --label org.opencontainers.image.revision=${{ github.sha }} --label org.opencontainers.image.version=${{ needs.metadata.outputs.version }}
+      CANDIDATE: ${{ github.event.release.tag_name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+      BUILD_ARGS: --label org.opencontainers.image.revision=${{ github.sha }} --label org.opencontainers.image.version=${{ github.event.release.tag_name }}
     steps:
       - uses: actions/checkout@v7
+      - name: Check release tag matches launcher version
+        id: version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("launcher/Cargo.toml", "rb"))["package"]["version"])')
+          if test "$TAG" != "v$version"; then
+            echo "Release tag $TAG must match launcher version v$version" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - name: Install stable Rust and musl target
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add "${{ matrix.target }}"
       - name: Build and package launcher
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           cargo build --release --locked --manifest-path launcher/Cargo.toml --target "${{ matrix.target }}"
           asset="playpen-${{ matrix.suffix }}.tar.gz"
           tar -czf "$asset" -C "launcher/target/${{ matrix.target }}/release" playpen
           mkdir -p "$RUNNER_TEMP/package"
           tar -xzf "$asset" -C "$RUNNER_TEMP/package"
-          test "$("$RUNNER_TEMP/package/playpen" --version)" = "playpen ${{ needs.metadata.outputs.version }}"
+          test "$("$RUNNER_TEMP/package/playpen" --version)" = "playpen $VERSION"
       - name: Build base image
         run: make base ENGINE=docker
       - name: Build Rust flavor
@@ -155,7 +119,7 @@ jobs:
           if-no-files-found: error
 
   manifests:
-    needs: [metadata, build]
+    needs: build
     runs-on: ubuntu-26.04
     permissions:
       contents: read
@@ -172,8 +136,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Assemble and verify versioned multiarch indexes
-        env:
-          TAG: ${{ needs.metadata.outputs.tag }}
         run: |
           mkdir -p release-image-digests
           for image in $IMAGES; do
@@ -194,7 +156,7 @@ jobs:
           if-no-files-found: error
 
   consumers:
-    needs: [metadata, build, manifests]
+    needs: [build, manifests]
     strategy:
       fail-fast: false
       matrix:
@@ -229,7 +191,6 @@ jobs:
       - name: Verify anonymous versioned pulls on native architecture
         env:
           ENGINE: ${{ matrix.engine }}
-          TAG: ${{ needs.metadata.outputs.tag }}
           ARCH: ${{ matrix.platform.arch }}
         run: |
           export DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker"
@@ -251,7 +212,7 @@ jobs:
           python3 scripts/smoke.py --engine "$ENGINE" --launcher "$RUNNER_TEMP/package/playpen"
 
   publish:
-    needs: [metadata, consumers]
+    needs: consumers
     runs-on: ubuntu-26.04
     permissions:
       contents: write
@@ -266,14 +227,32 @@ jobs:
         with:
           name: release-image-digests
           path: release-image-digests
+      - name: Attach artifacts to the existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum playpen-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          # Reruns replace generated assets without editing the release itself.
+          gh release upload "$TAG" playpen-*.tar.gz SHA256SUMS install.sh --clobber
+      - name: Check GitHub's current Latest release
+        id: latest
+        if: ${{ !github.event.release.prerelease }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          if test "$latest" = "$TAG"; then
+            echo 'promote=true' >> "$GITHUB_OUTPUT"
+          fi
       - uses: docker/login-action@v4
-        if: needs.metadata.outputs.promote == 'true'
+        if: steps.latest.outputs.promote == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Promote verified stable indexes
-        if: needs.metadata.outputs.promote == 'true'
+      - name: Promote verified Latest release indexes
+        if: steps.latest.outputs.promote == 'true'
         run: |
           for image in $IMAGES; do
             source=$(cat "release-image-digests/$image")
@@ -286,20 +265,3 @@ jobs:
             digest=$(docker buildx imagetools inspect "$REGISTRY/$image:latest" --format '{{json .Manifest}}' | jq -er '.digest')
             test "$(cat "release-image-digests/$image")" = "$REGISTRY/$image@$digest"
           done
-      - name: Publish complete GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.metadata.outputs.tag }}
-          PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
-          PROMOTE: ${{ needs.metadata.outputs.promote }}
-        run: |
-          sha256sum playpen-*.tar.gz > SHA256SUMS
-          sha256sum -c SHA256SUMS
-          # Failed uploads remain a draft. Never replace published assets.
-          if gh release view "$TAG" --json isDraft > "$RUNNER_TEMP/release.json" 2>/dev/null; then
-            jq -e '.isDraft' "$RUNNER_TEMP/release.json"
-          else
-            gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes
-          fi
-          gh release upload "$TAG" playpen-*.tar.gz SHA256SUMS install.sh --clobber
-          gh release edit "$TAG" --draft=false --prerelease="$PRERELEASE" --latest="$PROMOTE"
