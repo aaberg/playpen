@@ -49,6 +49,9 @@ RUN printf '%s\n' \
     && chown agent:agent /home/agent/.bashrc
 
 USER agent
+# Numeric host UIDs need not have a passwd entry inside the image. Keep tools
+# on the mounted agent home instead of falling back to / or /workspace.
+ENV HOME=/home/agent
 
 # Minimal git identity - override per project or mount your own
 RUN git config --global init.defaultBranch main

@@ -125,8 +125,10 @@ The agent itself is a thin image layer the launcher builds and maintains:
   `flavors/jvm/Containerfile` for another line (e.g. 21). Gradle projects
   rely on their wrapper; Maven covers wrapper-less builds. Standalone
   `kotlinc` is for scripts and quick experiments.
-- User mapping: podman `--userns=keep-id`; docker `--user $UID:$GID`. Either
-  way, files the agent creates are owned by you on the host.
+- User mapping: podman `--userns=keep-id` plus explicit `--user $UID:$GID`;
+  docker `--user $UID:$GID`. Files the agent creates are owned by you on the
+  host, even when your UID differs from the image's agent UID. Images set
+  `HOME=/home/agent` so numeric users without a passwd entry use the mounted home.
 - `:Z` labels bind mounts for SELinux (Fedora); the named volume is labeled
   automatically.
 - API keys: `~/.config/playpen/keys.conf` (see `keys.conf.example`) - one

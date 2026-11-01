@@ -309,8 +309,11 @@ class Smoke:
             ) for flavor in ("base", "rust", "jvm")
         }
         boundary = f'''
+id
+printf 'HOME=%s\\n' "$HOME"
 [[ $(id -u) = {os.getuid()} && $(id -g) = {os.getgid()} && $(id -u) != 0 ]]
 [[ $PWD = /workspace ]]
+[[ $HOME = /home/agent ]]
 [[ $(cat /workspace/host-workspace) = workspace-input ]]
 [[ $(cat /home/agent/host-home) = home-input ]]
 [[ $SMOKE_DUMMY_SECRET = {shlex.quote(DUMMY)} ]]

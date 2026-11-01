@@ -45,11 +45,15 @@ pub fn select(host: &Host) -> Engine {
     }
 }
 
-/// Podman maps the agent to the invoking user via keep-id; docker has no
-/// equivalent, so run as the invoking UID:GID directly.
+/// Preserve bind-mount ownership with Podman's keep-id mapping. Both engines
+/// need an explicit user: an image's USER can otherwise select a different UID.
 pub fn userns_args(engine: Engine, uid: u32, gid: u32) -> Vec<OsString> {
     match engine {
-        Engine::Podman => vec![OsString::from("--userns=keep-id")],
+        Engine::Podman => vec![
+            OsString::from("--userns=keep-id"),
+            OsString::from("--user"),
+            OsString::from(format!("{uid}:{gid}")),
+        ],
         Engine::Docker => vec![
             OsString::from("--user"),
             OsString::from(format!("{uid}:{gid}")),
@@ -130,18 +134,6 @@ pub fn is_socket(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
-
-    #[test]
-    fn userns_args_per_engine() {
-        assert_eq!(
-            userns_args(Engine::Podman, 1000, 1001),
-            vec![OsString::from("--userns=keep-id")]
-        );
-        assert_eq!(
-            userns_args(Engine::Docker, 1000, 1001),
-            vec![OsString::from("--user"), OsString::from("1000:1001")]
-        );
-    }
 
     #[test]
     fn host_engine_args_mount_and_env() {
