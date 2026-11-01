@@ -108,11 +108,11 @@ The agent itself is a thin image layer the launcher builds and maintains:
 
 ## Notes
 
-- Flavors are published to `ghcr.io/aaberg` on version-tagged releases, not
-  pushes to `main`. `:latest` tracks the newest verified stable release;
-  prereleases and older maintenance releases do not advance it. Anonymous
-  pulls require public packages. `PLAYPEN_REGISTRY` overrides the registry
-  (a mirror, or images you pushed under another owner).
+- Flavors are published to `ghcr.io/aaberg` when a GitHub Release is published,
+  not on tag pushes or pushes to `main`. Verified images advance `:latest`
+  only when GitHub currently designates that release as Latest; prereleases
+  never advance it. Anonymous pulls require public packages. `PLAYPEN_REGISTRY`
+  overrides the registry (a mirror, or images you pushed under another owner).
 - The base image is `fedora-minimal` (`ARG FEDORA_VERSION` in
   `base/Containerfile`); bump it and `make base` to move to a newer release.
   It carries no harness anymore - the launcher layers omp (and later
@@ -178,27 +178,40 @@ python3 scripts/smoke.py --engine podman --launcher launcher/target/release/play
 # For Docker, build images with ENGINE=docker and use --engine docker.
 ```
 
-To release, update `launcher/Cargo.toml` and `launcher/Cargo.lock`, then push
-`v<version>` matching the package version, for example `v0.1.0` or
-`v0.2.0-rc.1`. `.github/workflows/release.yml`:
+To release, update `launcher/Cargo.toml` and `launcher/Cargo.lock` and commit
+the version change. In **GitHub → Releases → Draft a new release**, choose or
+create a `v<version>` tag matching the launcher package version, for example
+`v0.1.0` or `v0.2.0-rc.1`. Write the title and notes, choose the prerelease and
+Latest settings, then click **Publish release**. Saving a draft or pushing a
+tag alone does not start `.github/workflows/release.yml`.
 
-1. Validates the version, rejects already-published releases, and runs launcher CI.
+The workflow:
+
+1. Runs launcher CI and checks that the release tag matches the launcher version.
 2. Builds native musl packages and images, then smokes the extracted binaries.
 3. Pushes run-specific architecture references, assembles versioned OCI indexes
    from their digests (including provenance), and checks both Linux architectures.
 4. Pulls each versioned image without registry credentials on both architectures
    with Docker and Podman, then runs the packaged-launcher smoke again.
-5. Promotes the tested indexes to `:latest` only for a newer stable version,
-   verifies the public aliases, and publishes the complete GitHub Release with
-   checksums and `install.sh`. Failed asset uploads remain a draft.
+5. Attaches the binary archives, checksums, and `install.sh` to your existing
+   release. It then advances container `:latest` only if the release is not a
+   prerelease and GitHub still designates it as Latest, verifying the public aliases.
 
-Releases are serialized and active publication is not cancelled by a new tag.
-Unpublished failed attempts can be retried; published release assets and image
-tags are not overwritten. Image build inputs still include moving Fedora
-packages, Bun, and Rust stable: retain published digests for exact rollback.
-The launcher still consumes the stable `:latest` channel, not a version pinned
-to its binary. Explicit versioned image arguments run raw images without
-automatic harness layering.
+The workflow never creates a release or changes its title, notes, publication
+status, or prerelease/Latest settings. Releases are serialized and active
+publication is not cancelled by a newly published release. GitHub's Latest
+selection, rather than semantic-version ordering, controls the stable image channel.
+
+The release is public before its assets and images are ready. While the workflow
+runs, or if it fails, the release can be incomplete; the installer's
+`releases/latest/download` links can temporarily point to missing assets. Retry
+failed runs from Actions. Reruns replace generated assets and versioned image tags,
+but preserve your release text and settings.
+
+Image build inputs still include moving Fedora packages, Bun, and Rust stable:
+retain published digests for exact rollback. The launcher still consumes the
+stable `:latest` channel, not a version pinned to its binary. Explicit versioned
+image arguments run raw images without automatic harness layering.
 
 ### GHCR package setup and troubleshooting
 
@@ -218,7 +231,7 @@ The previous GHCR `denied` error occurred after layer uploads, while publishing
 image metadata. Successful login does not prove package write access, and a
 public repository link does not prove permission inheritance. Named per-image
 push steps now provide detailed diagnostics. Check the package settings before
-changing credentials; a failed publication does not publish a GitHub Release.
+changing credentials; a failed workflow leaves the manually published release incomplete.
 
 ## Roadmap
 
