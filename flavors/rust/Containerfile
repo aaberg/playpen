@@ -20,8 +20,9 @@ RUN dnf -y install \
       fd-find \
     && dnf clean all
 
-# Rust via rustup, system-wide (survives agent-user home wipes)
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal \
+# Stage rustup under /root regardless of the inherited runtime HOME.
+# The moved toolchain survives agent-user home wipes.
+RUN curl -sSf https://sh.rustup.rs | HOME=/root sh -s -- -y --default-toolchain stable --profile minimal \
       --component rustfmt,clippy,rust-analyzer \
     && mv /root/.cargo /usr/local/cargo \
     && mv /root/.rustup /usr/local/rustup \
