@@ -4,6 +4,7 @@
 #   playpen playpen-<name>
 
 ENGINE ?= podman
+BUILD_ARGS ?=
 CARGO ?= cargo
 LAUNCHER ?= launcher
 
@@ -20,16 +21,16 @@ TRIPLE_DIR := $(if $(CARGO_BUILD_TARGET),$(CARGO_BUILD_TARGET)/,)
 all: base rust jvm
 
 base:
-	$(ENGINE) build -t playpen-base -f base/Containerfile base/
+	$(ENGINE) build $(BUILD_ARGS) -t playpen-base -f base/Containerfile base/
 
 rust: base
-	$(ENGINE) build -t playpen-rust -f flavors/rust/Containerfile flavors/rust
+	$(ENGINE) build $(BUILD_ARGS) -t playpen-rust -f flavors/rust/Containerfile flavors/rust
 
 jvm: base
-	$(ENGINE) build -t playpen-jvm -f flavors/jvm/Containerfile flavors/jvm
+	$(ENGINE) build $(BUILD_ARGS) -t playpen-jvm -f flavors/jvm/Containerfile flavors/jvm
 
 test:
-	$(CARGO) test --manifest-path $(LAUNCHER)/Cargo.toml
+	$(CARGO) test --locked --manifest-path $(LAUNCHER)/Cargo.toml
 
 install:
 	$(CARGO) build --release --manifest-path $(LAUNCHER)/Cargo.toml \

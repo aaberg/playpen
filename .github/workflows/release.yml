@@ -1,65 +1,305 @@
-# Release: build static musl binaries (amd64, arm64) on native runners,
-# publish a GitHub Release with sha256 checksums and install.sh. Push a v*
-# tag to publish; install.sh fetches releases/latest/download (ROADMAP.md
-# phase 3).
 name: release
 
 on:
   push:
     tags: ["v*"]
 
+# Serialize releases, including different tags, so an older run cannot race a
+# newer run while deciding whether to advance the stable channel.
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
+
+env:
+  REGISTRY: ghcr.io/aaberg
+  IMAGES: playpen-base playpen-rust playpen-jvm
 
 jobs:
+  metadata:
+    runs-on: ubuntu-26.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      promote: ${{ steps.release.outputs.promote }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate release version and stable-channel ordering
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" > "$RUNNER_TEMP/releases.json"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          semver = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?")
+          tag = os.environ["GITHUB_REF_NAME"]
+          match = semver.fullmatch(tag)
+          if not match:
+              raise SystemExit("Release tag must be vMAJOR.MINOR.PATCH, optionally with a prerelease suffix")
+          prerelease = match[4] is not None
+          if prerelease and any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in match[4].split(".")):
+              raise SystemExit("Numeric prerelease identifiers must not have leading zeroes")
+          version = tag[1:]
+          package = tomllib.loads(Path("launcher/Cargo.toml").read_text())["package"]
+          if package["version"] != version:
+              raise SystemExit(f"Tag {tag} does not match launcher version {package['version']}")
+          releases = [release for page in json.loads((Path(os.environ["RUNNER_TEMP"]) / "releases.json").read_text()) for release in page]
+          published = [release for release in releases if not release["draft"]]
+          if any(release["tag_name"] == tag for release in published):
+              raise SystemExit(f"Release {tag} is already published; published assets and image tags are not overwritten")
+          current = tuple(int(match[i]) for i in (1, 2, 3))
+          stable = [semver.fullmatch(release["tag_name"]) for release in published if not release["prerelease"]]
+          stable = [tuple(int(item[i]) for i in (1, 2, 3)) for item in stable if item and item[4] is None]
+          promote = not prerelease and (not stable or current > max(stable))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for key, value in {"tag": tag, "version": version, "prerelease": str(prerelease).lower(), "promote": str(promote).lower()}.items():
+                  print(f"{key}={value}", file=output)
+          PY
+
+  checks:
+    needs: metadata
+    uses: ./.github/workflows/ci.yml
+    with:
+      skip-containers: true
+    permissions:
+      contents: read
+
   build:
+    needs: [metadata, checks]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-26.04
+            arch: amd64
             target: x86_64-unknown-linux-musl
             suffix: x86_64-linux-musl
           - runner: ubuntu-26.04-arm
+            arch: arm64
             target: aarch64-unknown-linux-musl
             suffix: aarch64-linux-musl
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CANDIDATE: ${{ needs.metadata.outputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+      BUILD_ARGS: --label org.opencontainers.image.revision=${{ github.sha }} --label org.opencontainers.image.version=${{ needs.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - name: install musl toolchain
+      - name: Install stable Rust and musl target
         run: |
-          rustup target add ${{ matrix.target }}
-          sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: build
-        # The dependency set is pure Rust; the musl targets link with the
-        # CRT objects rustc ships (self-contained), no C toolchain needed.
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+      - name: Build and package launcher
         run: |
-          cargo build --release --locked --manifest-path launcher/Cargo.toml --target ${{ matrix.target }}
-          tar -czf "playpen-${{ matrix.suffix }}.tar.gz" -C "launcher/target/${{ matrix.target }}/release" playpen
+          cargo build --release --locked --manifest-path launcher/Cargo.toml --target "${{ matrix.target }}"
+          asset="playpen-${{ matrix.suffix }}.tar.gz"
+          tar -czf "$asset" -C "launcher/target/${{ matrix.target }}/release" playpen
+          mkdir -p "$RUNNER_TEMP/package"
+          tar -xzf "$asset" -C "$RUNNER_TEMP/package"
+          test "$("$RUNNER_TEMP/package/playpen" --version)" = "playpen ${{ needs.metadata.outputs.version }}"
+      - name: Build base image
+        run: make base ENGINE=docker
+      - name: Build Rust flavor
+        run: make rust ENGINE=docker
+      - name: Build JVM flavor
+        run: make jvm ENGINE=docker
+      - name: Smoke extracted launcher and exact candidate images
+        run: python3 scripts/smoke.py --engine docker --launcher "$RUNNER_TEMP/package/playpen"
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push base image
+        run: |
+          docker tag playpen-base:latest "$REGISTRY/playpen-base:$CANDIDATE"
+          docker --debug push "$REGISTRY/playpen-base:$CANDIDATE"
+      - name: Push Rust image
+        run: |
+          docker tag playpen-rust:latest "$REGISTRY/playpen-rust:$CANDIDATE"
+          docker --debug push "$REGISTRY/playpen-rust:$CANDIDATE"
+      - name: Push JVM image
+        run: |
+          docker tag playpen-jvm:latest "$REGISTRY/playpen-jvm:$CANDIDATE"
+          docker --debug push "$REGISTRY/playpen-jvm:$CANDIDATE"
+      - name: Record registry digests
+        run: |
+          mkdir -p "image-digests/${{ matrix.arch }}"
+          for image in $IMAGES; do
+            ref="$REGISTRY/$image:$CANDIDATE"
+            digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -er '.digest')
+            printf '%s@%s\n' "$REGISTRY/$image" "$digest" > "image-digests/${{ matrix.arch }}/$image"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: image-digests-${{ matrix.arch }}
+          path: image-digests/
+          if-no-files-found: error
       - uses: actions/upload-artifact@v7
         with:
           name: playpen-${{ matrix.suffix }}
           path: playpen-${{ matrix.suffix }}.tar.gz
           if-no-files-found: error
 
-  publish:
-    needs: build
-    runs-on: ubuntu-24.04
+  manifests:
+    needs: [metadata, build]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: image-digests-*
+          path: image-digests
+          merge-multiple: true
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Assemble and verify versioned multiarch indexes
+        env:
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          mkdir -p release-image-digests
+          for image in $IMAGES; do
+            amd64=$(cat "image-digests/amd64/$image")
+            arm64=$(cat "image-digests/arm64/$image")
+            ref="$REGISTRY/$image:$TAG"
+            # Each source can itself be an OCI index containing provenance.
+            docker buildx imagetools create --tag "$ref" "$amd64" "$arm64"
+            docker buildx imagetools inspect "$ref" --raw | jq -e '
+              [.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]'
+            digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -er '.digest')
+            printf '%s@%s\n' "$REGISTRY/$image" "$digest" > "release-image-digests/$image"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-image-digests
+          path: release-image-digests/
+          if-no-files-found: error
+
+  consumers:
+    needs: [metadata, build, manifests]
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [docker, podman]
+        platform:
+          - runner: ubuntu-26.04
+            arch: amd64
+            suffix: x86_64-linux-musl
+          - runner: ubuntu-26.04-arm
+            arch: arm64
+            suffix: aarch64-linux-musl
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
+          name: playpen-${{ matrix.platform.suffix }}
+          path: package
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-image-digests
+          path: release-image-digests
+      - name: Set up rootless Podman
+        if: matrix.engine == 'podman'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+          if test -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Verify anonymous versioned pulls on native architecture
+        env:
+          ENGINE: ${{ matrix.engine }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker"
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/anonymous-auth.json"
+          mkdir -p "$DOCKER_CONFIG"
+          printf '{"auths":{}}\n' > "$REGISTRY_AUTH_FILE"
+          for image in $IMAGES; do
+            ref="$REGISTRY/$image:$TAG"
+            expected=$(cat "release-image-digests/$image")
+            # Use a manifest GET independent of the selected engine's cache.
+            actual=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -er '.digest')
+            test "$expected" = "$REGISTRY/$image@$actual"
+            "$ENGINE" pull "$ref"
+            test "$("$ENGINE" image inspect "$ref" --format '{{.Architecture}}')" = "$ARCH"
+            "$ENGINE" tag "$ref" "$image:latest"
+          done
+          mkdir -p "$RUNNER_TEMP/package"
+          tar -xzf "package/playpen-${{ matrix.platform.suffix }}.tar.gz" -C "$RUNNER_TEMP/package"
+          python3 scripts/smoke.py --engine "$ENGINE" --launcher "$RUNNER_TEMP/package/playpen"
+
+  publish:
+    needs: [metadata, consumers]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: playpen-*
           merge-multiple: true
-      - name: checksums
-        run: sha256sum playpen-*.tar.gz > SHA256SUMS
-      - name: publish the release
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-image-digests
+          path: release-image-digests
+      - uses: docker/login-action@v4
+        if: needs.metadata.outputs.promote == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote verified stable indexes
+        if: needs.metadata.outputs.promote == 'true'
+        run: |
+          for image in $IMAGES; do
+            source=$(cat "release-image-digests/$image")
+            docker buildx imagetools create --tag "$REGISTRY/$image:latest" "$source"
+          done
+          # Verify the public aliases resolve to exactly the tested indexes.
+          export DOCKER_CONFIG="$RUNNER_TEMP/anonymous-docker"
+          mkdir -p "$DOCKER_CONFIG"
+          for image in $IMAGES; do
+            digest=$(docker buildx imagetools inspect "$REGISTRY/$image:latest" --format '{{json .Manifest}}' | jq -er '.digest')
+            test "$(cat "release-image-digests/$image")" = "$REGISTRY/$image@$digest"
+          done
+      - name: Publish complete GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          PROMOTE: ${{ needs.metadata.outputs.promote }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          files="playpen-x86_64-linux-musl.tar.gz playpen-aarch64-linux-musl.tar.gz SHA256SUMS install.sh"
-          # a re-run after a partial publish uploads into the same release
-          if gh release view "$tag" > /dev/null 2>&1; then
-            gh release upload "$tag" $files --clobber
+          sha256sum playpen-*.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          # Failed uploads remain a draft. Never replace published assets.
+          if gh release view "$TAG" --json isDraft > "$RUNNER_TEMP/release.json" 2>/dev/null; then
+            jq -e '.isDraft' "$RUNNER_TEMP/release.json"
           else
-            gh release create "$tag" --title "$tag" --generate-notes $files
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes
           fi
+          gh release upload "$TAG" playpen-*.tar.gz SHA256SUMS install.sh --clobber
+          gh release edit "$TAG" --draft=false --prerelease="$PRERELEASE" --latest="$PROMOTE"

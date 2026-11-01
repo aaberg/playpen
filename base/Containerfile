@@ -4,6 +4,7 @@
 # Rebuild rarely (new tools / Fedora release): make base
 ARG FEDORA_VERSION=44
 FROM registry.fedoraproject.org/fedora-minimal:${FEDORA_VERSION}
+LABEL org.opencontainers.image.source="https://github.com/aaberg/playpen"
 
 # Core toolchain. Order: least- to most-often-changing.
 # fedora-minimal ships microdnf and little else; bash, curl and shadow-utils

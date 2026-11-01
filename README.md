@@ -18,7 +18,7 @@ flavors/rust/        playpen-rust: rustup toolchain, sccache, native build deps
 flavors/jvm/         playpen-jvm: JDK LTS, Maven, standalone Kotlin compiler
 launcher/            Rust launcher crate (binary: playpen)
 install.sh           curl-installer for the released musl binary
-.github/workflows    CI: multi-arch image publishing to ghcr.io + releases
+.github/workflows    PR/main validation and release-only multi-arch publication
 keys.conf.example    template for ~/.config/playpen/keys.conf (API keys)
 Makefile             build helpers
 ```
@@ -108,11 +108,11 @@ The agent itself is a thin image layer the launcher builds and maintains:
 
 ## Notes
 
-- Flavors are published to `ghcr.io/aaberg` as multi-arch manifests
-  (amd64/arm64; CI: `.github/workflows/images.yml`). Anonymous pulls need
-  the packages public - flip "Package visibility" once in the GitHub
-  package settings after the first push. `PLAYPEN_REGISTRY` overrides the
-  registry (a mirror, or images you pushed under another owner).
+- Flavors are published to `ghcr.io/aaberg` on version-tagged releases, not
+  pushes to `main`. `:latest` tracks the newest verified stable release;
+  prereleases and older maintenance releases do not advance it. Anonymous
+  pulls require public packages. `PLAYPEN_REGISTRY` overrides the registry
+  (a mirror, or images you pushed under another owner).
 - The base image is `fedora-minimal` (`ARG FEDORA_VERSION` in
   `base/Containerfile`); bump it and `make base` to move to a newer release.
   It carries no harness anymore - the launcher layers omp (and later
@@ -150,6 +150,73 @@ The agent itself is a thin image layer the launcher builds and maintains:
   on the engine - treat it as a trusted-project switch.
 - The agent's git identity: set it once inside the persistent home
   (`git config --global user.name/user.email`) or mount a minimal gitconfig.
+
+## CI and releases
+
+`.github/workflows/ci.yml` runs on pull requests and pushes to `main`. It
+checks workflow syntax/shell steps, Rust formatting and Clippy, and the
+launcher's unit and stub-engine integration tests on native amd64/arm64
+runners. A Docker/Podman matrix builds all images and exercises the actual
+launcher extracted from each musl release tarball.
+
+The credential-free smoke runner compiles and runs Rust, Java, and Kotlin
+examples, checks workspace/home mounts and file ownership, verifies dummy-key
+handling and exit status propagation, and builds/reuses a real omp harness
+layer. It uses a pseudo-terminal because the launcher is interactive. Its
+temporary configuration, image aliases, and cargo volume are removed afterward;
+it does not use your API keys or call an AI provider.
+
+Run the same checks locally with a real engine:
+
+```bash
+make test
+make all ENGINE=podman
+cargo build --release --locked --manifest-path launcher/Cargo.toml
+python3 scripts/smoke.py --engine podman --launcher launcher/target/release/playpen
+# For Docker, build images with ENGINE=docker and use --engine docker.
+```
+
+To release, update `launcher/Cargo.toml` and `launcher/Cargo.lock`, then push
+`v<version>` matching the package version, for example `v0.1.0` or
+`v0.2.0-rc.1`. `.github/workflows/release.yml`:
+
+1. Validates the version, rejects already-published releases, and runs launcher CI.
+2. Builds native musl packages and images, then smokes the extracted binaries.
+3. Pushes run-specific architecture references, assembles versioned OCI indexes
+   from their digests (including provenance), and checks both Linux architectures.
+4. Pulls each versioned image without registry credentials on both architectures
+   with Docker and Podman, then runs the packaged-launcher smoke again.
+5. Promotes the tested indexes to `:latest` only for a newer stable version,
+   verifies the public aliases, and publishes the complete GitHub Release with
+   checksums and `install.sh`. Failed asset uploads remain a draft.
+
+Releases are serialized and active publication is not cancelled by a new tag.
+Unpublished failed attempts can be retried; published release assets and image
+tags are not overwritten. Image build inputs still include moving Fedora
+packages, Bun, and Rust stable: retain published digests for exact rollback.
+The launcher still consumes the stable `:latest` channel, not a version pinned
+to its binary. Explicit versioned image arguments run raw images without
+automatic harness layering.
+
+### GHCR package setup and troubleshooting
+
+For `playpen-base`, `playpen-rust`, and `playpen-jvm`, ensure:
+
+- **Package settings → Manage Actions access** grants `aaberg/playpen` Write
+  access, or the package inherits the repository's permissions.
+- **Package visibility** is Public, so first-use launcher pulls work without
+  authentication. Newly created packages default to private; a first release
+  may stop at the anonymous-consumer gate until visibility is changed.
+
+Images carry the repository source label, and release builds add version and
+revision labels. The workflow uses `GITHUB_TOKEN` with package-write permission
+only in publication jobs; CI never publishes containers.
+
+The previous GHCR `denied` error occurred after layer uploads, while publishing
+image metadata. Successful login does not prove package write access, and a
+public repository link does not prove permission inheritance. Named per-image
+push steps now provide detailed diagnostics. Check the package settings before
+changing credentials; a failed publication does not publish a GitHub Release.
 
 ## Roadmap
 
