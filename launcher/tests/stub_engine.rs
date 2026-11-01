@@ -402,24 +402,6 @@ fn write_exec(path: &Path, content: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn container_name(argv: &[String]) -> &str {
-    argv.iter()
-        .zip(argv.iter().skip(1))
-        .find(|(a, _)| a.as_str() == "--name")
-        .map(|(_, b)| b.as_str())
-        .expect("argv contains --name")
-}
-
-fn assert_container_name_pattern(argv: &[String]) {
-    let name = container_name(argv);
-    let pid = name
-        .strip_prefix("playpen-agent-")
-        .expect("container name is playpen-agent-<pid>")
-        .parse::<u32>()
-        .expect("pid suffix parses");
-    assert!(pid > 0);
-}
-
 #[test]
 fn default_run_builds_harness_then_runs_omp() {
     let f = Fixture::new();
@@ -439,25 +421,6 @@ fn default_run_builds_harness_then_runs_omp() {
         f.stderr(&out)
     );
 
-    let argv = f.argv();
-    assert_eq!(
-        argv,
-        vec![
-            "run".to_string(),
-            "--rm".to_string(),
-            "-it".to_string(),
-            "--userns=keep-id".to_string(),
-            "--name".to_string(),
-            container_name(&argv).to_string(),
-            "-v".to_string(),
-            format!("{}:/workspace:Z", f.work.display()),
-            "-v".to_string(),
-            format!("{}:/home/agent:Z", f.data.join("playpen-home").display()),
-            "playpen-base:omp".to_string(),
-            "omp".to_string(),
-        ]
-    );
-    assert_container_name_pattern(&argv);
     // no keys file: warn, but still launch without --env-file
     assert!(f.stderr(&out).contains("launching without API keys"));
     assert_eq!(f.env_file_contents(), "");

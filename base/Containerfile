@@ -4,6 +4,7 @@
 # Rebuild rarely (new tools / Fedora release): make base
 ARG FEDORA_VERSION=44
 FROM registry.fedoraproject.org/fedora-minimal:${FEDORA_VERSION}
+LABEL org.opencontainers.image.source="https://github.com/aaberg/playpen"
 
 # Core toolchain. Order: least- to most-often-changing.
 # fedora-minimal ships microdnf and little else; bash, curl and shadow-utils
@@ -48,6 +49,9 @@ RUN printf '%s\n' \
     && chown agent:agent /home/agent/.bashrc
 
 USER agent
+# Numeric host UIDs need not have a passwd entry inside the image. Keep tools
+# on the mounted agent home instead of falling back to / or /workspace.
+ENV HOME=/home/agent
 
 # Minimal git identity - override per project or mount your own
 RUN git config --global init.defaultBranch main

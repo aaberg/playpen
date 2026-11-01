@@ -1,0 +1,6 @@
+# These hosted runners are in use by this project but are not yet included in
+# actionlint 1.7.12's built-in runner-label list.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
