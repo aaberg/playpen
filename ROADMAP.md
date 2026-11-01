@@ -114,9 +114,11 @@ without rebuilding the toolchain.
 
 ## Phase 3 - CI publishing + installer
 
-- GitHub Actions: build base + flavors multi-arch on native amd64/arm64
-  runners, push to ghcr.io as multi-arch manifests; build musl binaries
-  (x86_64, aarch64) with sha256 checksums; publish install.sh.
+- GitHub Actions: PR/main validation includes native amd64/arm64 launcher tests
+  and real Docker/Podman smoke of packaged musl binaries. Matching `v<version>`
+  tags publish versioned multi-arch flavor images and binary releases only
+  after consumer checks; `latest` advances only for newer stable releases.
+  Publish sha256 checksums and install.sh with the complete GitHub Release.
 - Launcher: pull `ghcr.io/<owner>/<image>` when missing locally; local
   images keep working offline (a pull only happens when the image is
   absent).
@@ -156,8 +158,6 @@ the VM engines there.
 ## Open questions
 
 - Exact npm packages / exec names for vibe and opencode in the registry.
-- ghcr tag scheme: `latest`, a `stable` pointer, or semver pinned per
-  launcher version.
 - macOS agent-home convention: keep `~/.local/share/playpen-home` for
   cross-platform consistency, or `~/Library/Application Support`.
 - `--shell` target: harness image (current decision) vs raw flavor image.
