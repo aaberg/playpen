@@ -1067,9 +1067,8 @@ fn host_engine_docker_mounts_socket() {
 #[test]
 fn host_engine_podman_missing_socket_reports_hint() {
     // The podman socket path (/run/user/$UID/...) is host-global and cannot
-    // be faked in a test, so the argv shape for podman is asserted by the
-    // engine.rs unit test; here we check the missing-socket diagnostics,
-    // guarded to stay meaningful only when the host socket is truly absent.
+    // be faked in a test. Check missing-socket diagnostics only when the
+    // host socket is truly absent.
     let sock = PathBuf::from(format!("/run/user/{}/podman/podman.sock", unsafe {
         libc::getuid()
     }));

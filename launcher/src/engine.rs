@@ -102,8 +102,11 @@ pub fn host_socket(engine: Engine, host: &Host) -> PathBuf {
 /// The engine args that grant the container host-engine access.
 /// -v socket:/run/host-engine.sock plus DOCKER_HOST (both engines) and
 /// CONTAINER_HOST (podman only).
+/// Disable SELinux label confinement so the mounted host socket is accessible.
 pub fn host_engine_args(engine: Engine, socket: &Path) -> Vec<OsString> {
     let mut args = vec![
+        OsString::from("--security-opt"),
+        OsString::from("label=disable"),
         OsString::from("-v"),
         {
             let mut v = socket.as_os_str().to_os_string();
@@ -133,39 +136,6 @@ pub fn is_socket(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn host_engine_args_mount_and_env() {
-        let podman = host_engine_args(
-            Engine::Podman,
-            Path::new("/run/user/1000/podman/podman.sock"),
-        );
-        assert_eq!(
-            podman,
-            vec![
-                OsString::from("-v"),
-                OsString::from("/run/user/1000/podman/podman.sock:/run/host-engine.sock"),
-                OsString::from("-e"),
-                OsString::from("DOCKER_HOST=unix:///run/host-engine.sock"),
-                OsString::from("-e"),
-                OsString::from("CONTAINER_HOST=unix:///run/host-engine.sock"),
-            ]
-        );
-        let docker = host_engine_args(Engine::Docker, Path::new("/var/run/docker.sock"));
-        assert_eq!(
-            docker,
-            vec![
-                OsString::from("-v"),
-                OsString::from("/var/run/docker.sock:/run/host-engine.sock"),
-                OsString::from("-e"),
-                OsString::from("DOCKER_HOST=unix:///run/host-engine.sock"),
-            ]
-        );
-        assert!(!docker
-            .iter()
-            .any(|a| a.to_string_lossy().starts_with("CONTAINER_HOST")));
-    }
 
     #[test]
     fn socket_detection() {

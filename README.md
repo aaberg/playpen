@@ -143,13 +143,16 @@ The agent itself is a thin image layer the launcher builds and maintains:
   per-project key set. Literal values are plaintext in the config file -
   keep it mode 0600 (the launcher tightens it if looser) and prefer
   `op://`.
-- Host Podman access (Testcontainers etc.) is opt-in per launch:
+- Host engine access (Podman or Docker, for Testcontainers etc.) is opt-in per launch:
   `playpen --host-engine <flavor>` or `PLAYPEN_HOST_ENGINE=1` (per-project
-  via direnv). It mounts the host podman socket and points `CONTAINER_HOST`
-  / `DOCKER_HOST` at it. Without it the container gets no engine. With it
-  the isolation boundary is your host user: code inside can create sibling
-  containers that mount anything you can read and inspect every container
-  on the engine - treat it as a trusted-project switch.
+  via direnv). It mounts the host engine socket and sets `DOCKER_HOST`
+  (plus `CONTAINER_HOST` for Podman). Both engines also receive
+  `--security-opt label=disable` so SELinux permits access to the host socket;
+  normal launches retain SELinux label confinement and get no engine socket.
+  With host-engine access, code inside can create sibling containers that
+  mount files accessible to the engine service user and inspect every container
+  on that engine. Rootless Podman grants your host user's access; rootful Docker
+  effectively grants host root access. Treat this as a trusted-project switch.
 - The agent's git identity: set it once inside the persistent home
   (`git config --global user.name/user.email`) or mount a minimal gitconfig.
 
