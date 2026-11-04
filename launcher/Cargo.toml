@@ -1,6 +1,6 @@
 [package]
 name = "playpen"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Launch an AI coding agent inside a sandboxed container"
 
