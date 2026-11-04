@@ -274,6 +274,11 @@ launcher's unit and stub-engine integration tests on native amd64/arm64
 runners. A Docker/Podman matrix builds all images and exercises the actual
 launcher extracted from each musl release tarball.
 
+On Ubuntu 26.04, CI and release Podman setup also allow Podman's `SIGTERM` to
+the `pasta` networking helper in AppArmor and reload its profile before starting
+the API socket. This narrow workaround addresses rootless network cleanup
+failures tracked in [runner-images#15182](https://github.com/actions/runner-images/issues/15182).
+
 The credential-free smoke runner compiles and runs Rust, Java, and Kotlin
 examples, checks workspace/home mounts and file ownership, verifies dummy-key
 handling and exit status propagation, and builds/reuses a real omp harness
