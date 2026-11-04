@@ -20,6 +20,7 @@ clap = { version = "4", default-features = false, features = [
 libc = "0.2"
 signal-hook = "0.3"
 tempfile = "3"
+toml_edit = "0.22"
 
 [profile.release]
 strip = true
