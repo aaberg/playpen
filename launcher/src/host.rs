@@ -28,8 +28,6 @@ pub struct Host {
     /// PLAYPEN_REGISTRY (set and non-empty): where flavor images are
     /// pulled from when missing locally.
     pub registry_pref: Option<String>,
-    /// PLAYPEN_HOST_ENGINE matched ^(1|true|yes)$.
-    pub host_engine_env: bool,
     /// $PATH.
     pub path: OsString,
 }
@@ -51,9 +49,6 @@ impl Host {
             registry_pref: std::env::var("PLAYPEN_REGISTRY")
                 .ok()
                 .filter(|v| !v.is_empty()),
-            host_engine_env: host_engine_env_value(
-                std::env::var("PLAYPEN_HOST_ENGINE").ok().as_deref(),
-            ),
             path: std::env::var_os("PATH").unwrap_or_default(),
         }
     }
@@ -146,12 +141,6 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// PLAYPEN_HOST_ENGINE enables host-engine mode only for 1, true or yes
-/// (bash: `=~ ^(1|true|yes)$`).
-pub fn host_engine_env_value(value: Option<&str>) -> bool {
-    matches!(value, Some("1") | Some("true") | Some("yes"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,7 +157,6 @@ mod tests {
             workspace: PathBuf::from("/work"),
             engine_pref: None,
             registry_pref: None,
-            host_engine_env: false,
             path: OsString::from("/usr/bin:/bin"),
         }
     }
@@ -193,25 +181,6 @@ mod tests {
             PathBuf::from("/xdg/config/playpen/keys.conf")
         );
         assert_eq!(h.agent_home_dir(), PathBuf::from("/xdg/data/playpen-home"));
-    }
-
-    #[test]
-    fn host_engine_env_truthiness() {
-        let cases = [
-            (Some("1"), true),
-            (Some("true"), true),
-            (Some("yes"), true),
-            (Some("0"), false),
-            (Some("TRUE"), false),
-            (Some("Yes"), false),
-            (Some("yes "), false),
-            (Some(""), false),
-            (Some("on"), false),
-            (None, false),
-        ];
-        for (value, expected) in cases {
-            assert_eq!(host_engine_env_value(value), expected, "value {value:?}");
-        }
     }
 
     #[test]

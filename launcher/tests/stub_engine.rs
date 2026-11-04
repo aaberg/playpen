@@ -190,6 +190,27 @@ impl Fixture {
         file
     }
 
+    fn playpen_conf(&self, global: bool, content: &str) -> PathBuf {
+        let path = if global {
+            self.config.join("playpen/playpen.toml")
+        } else {
+            self.work.join(".playpen/playpen.toml")
+        };
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn assert_host_engine(&self, enabled: bool) {
+        assert_eq!(
+            self.argv()
+                .contains(&"DOCKER_HOST=unix:///run/host-engine.sock".to_string()),
+            enabled,
+            "host engine exposure in argv: {:?}",
+            self.argv()
+        );
+    }
+
     /// Seed an image with a Created timestamp (any engine layout).
     fn image(&self, image_ref: &str, created: &str) {
         let line = format!("{image_ref}\t{created}\n");
@@ -1103,51 +1124,419 @@ fn host_engine_docker_missing_socket_is_fatal() {
 }
 
 #[test]
-fn host_engine_via_environment_variable() {
+fn host_engine_config_precedence_and_flag_overrides() {
     let f = Fixture::new();
     f.stub_engine("docker");
     f.seed_fresh("playpen-base");
     let sock_dir = f.home.join(".docker/run");
     fs::create_dir_all(&sock_dir).unwrap();
-    let listener = std::os::unix::net::UnixListener::bind(sock_dir.join("docker.sock")).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(sock_dir.join("docker.sock")).unwrap();
 
-    // 1/true/yes enable, like the bash regex ^(1|true|yes)$
-    let out = f.run_with(
-        &[],
-        &[("PLAYPEN_HOST_ENGINE", "1"), ("PLAYPEN_ENGINE", "docker")],
-    );
-    f.assert_ok(&out);
-    assert!(f
-        .argv()
-        .contains(&"DOCKER_HOST=unix:///run/host-engine.sock".to_string()));
+    for (global, project, expected) in [("true", "false", false), ("false", "true", true)] {
+        f.playpen_conf(true, &format!("host_engine = {global}\n"));
+        f.playpen_conf(false, &format!("host_engine = {project}\n"));
+        let out = f.run_with(&[], &[("PLAYPEN_ENGINE", "docker")]);
+        f.assert_ok(&out);
+        f.assert_host_engine(expected);
 
-    let out = f.run_with(
-        &[],
-        &[("PLAYPEN_HOST_ENGINE", "yes"), ("PLAYPEN_ENGINE", "docker")],
-    );
-    f.assert_ok(&out);
-    assert!(f
-        .argv()
-        .contains(&"DOCKER_HOST=unix:///run/host-engine.sock".to_string()));
+        for (flag, enabled) in [("--host-engine", true), ("--no-host-engine", false)] {
+            let out = f.run_with(&[flag], &[("PLAYPEN_ENGINE", "docker")]);
+            f.assert_ok(&out);
+            f.assert_host_engine(enabled);
+        }
+    }
+}
 
-    // anything else leaves it off
-    let out = f.run_with(
-        &[],
-        &[("PLAYPEN_HOST_ENGINE", "0"), ("PLAYPEN_ENGINE", "docker")],
-    );
-    f.assert_ok(&out);
-    assert!(!f.argv().iter().any(|a| a.starts_with("DOCKER_HOST")));
+#[test]
+fn host_engine_flags_conflict_before_engine_discovery() {
+    let f = Fixture::new();
+    for flags in [
+        ["--host-engine", "--no-host-engine"],
+        ["--no-host-engine", "--host-engine"],
+    ] {
+        let out = f.run(&flags);
+        assert!(!out.status.success());
+        let stderr = f.stderr(&out);
+        assert!(stderr.contains("--host-engine"), "{stderr}");
+        assert!(stderr.contains("--no-host-engine"), "{stderr}");
+        assert!(!f.args_file.exists());
+    }
+}
+
+#[test]
+fn legacy_host_engine_environment_is_ignored() {
+    let f = Fixture::new();
+    f.stub_engine("docker");
+    f.seed_fresh("playpen-base");
+    let sock_dir = f.home.join(".docker/run");
+    fs::create_dir_all(&sock_dir).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(sock_dir.join("docker.sock")).unwrap();
 
     let out = f.run_with(
         &[],
         &[
-            ("PLAYPEN_HOST_ENGINE", "sure"),
+            ("PLAYPEN_HOST_ENGINE", "true"),
             ("PLAYPEN_ENGINE", "docker"),
         ],
     );
     f.assert_ok(&out);
-    assert!(!f.argv().iter().any(|a| a.starts_with("DOCKER_HOST")));
-    drop(listener);
+    f.assert_host_engine(false);
+
+    f.playpen_conf(true, "host_engine = true\n");
+    let out = f.run_with(
+        &[],
+        &[
+            ("PLAYPEN_HOST_ENGINE", "false"),
+            ("PLAYPEN_ENGINE", "docker"),
+        ],
+    );
+    f.assert_ok(&out);
+    f.assert_host_engine(true);
+}
+
+#[test]
+fn config_list_defaults_without_creating_files_or_requiring_engine() {
+    let f = Fixture::new();
+    for args in [vec!["config", "list"], vec!["config", "--global", "list"]] {
+        let out = f.run(&args);
+        f.assert_ok(&out);
+        let text = f.stdout(&out);
+        let listed = text.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(listed["host_engine"].as_bool(), Some(false));
+        assert!(text.contains("built-in default"), "{text}");
+    }
+    assert!(!f.work.join(".playpen").exists());
+    assert!(!f.config.join("playpen").exists());
+    assert!(!f.data.join("playpen-home").exists());
+}
+
+#[test]
+fn config_list_merges_nearest_project_over_global_from_subdirectory() {
+    let f = Fixture::new();
+    fs::create_dir(f.work.join(".git")).unwrap();
+    let global = f.playpen_conf(true, "host_engine = true\n");
+    let project = f.playpen_conf(false, "host_engine = false\n");
+    let cwd = f.work.join("src/nested");
+    fs::create_dir_all(&cwd).unwrap();
+    let list = || {
+        f.playpen(&["config", "list"])
+            .current_dir(&cwd)
+            .env("PWD", &cwd)
+            .output()
+            .unwrap()
+    };
+    let out = list();
+    f.assert_ok(&out);
+    let text = f.stdout(&out);
+    let listed = text.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(listed["host_engine"].as_bool(), Some(false));
+    assert!(text.contains(&project.display().to_string()), "{text}");
+    assert!(!text.contains(&global.display().to_string()), "{text}");
+    assert_eq!(
+        fs::read_to_string(&project).unwrap(),
+        "host_engine = false\n"
+    );
+    assert_eq!(fs::read_to_string(&global).unwrap(), "host_engine = true\n");
+
+    fs::write(&project, "# inherit global\n").unwrap();
+    let out = list();
+    f.assert_ok(&out);
+    let text = f.stdout(&out);
+    let listed = text.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(listed["host_engine"].as_bool(), Some(true));
+    assert!(text.contains(&global.display().to_string()), "{text}");
+}
+
+#[test]
+fn config_list_global_ignores_project_discovery_and_validation_errors() {
+    let f = Fixture::new();
+    let global = f.playpen_conf(true, "host_engine = true\n");
+    let project = f.playpen_conf(false, "host_engine = [\n");
+    let out = f.run(&["config", "list"]);
+    assert!(!out.status.success());
+    assert!(f.stderr(&out).contains(&project.display().to_string()));
+    let out = f.run(&["config", "--global", "list"]);
+    f.assert_ok(&out);
+    let text = f.stdout(&out);
+    let listed = text.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(listed["host_engine"].as_bool(), Some(true));
+    assert!(text.contains(&global.display().to_string()), "{text}");
+
+    fs::remove_dir_all(f.work.join(".playpen")).unwrap();
+    fs::write(f.work.join(".playpen"), "not a directory").unwrap();
+    fs::remove_file(&global).unwrap();
+    let out = f.run(&["config", "list", "--global"]);
+    f.assert_ok(&out);
+    let text = f.stdout(&out);
+    let listed = text.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(listed["host_engine"].as_bool(), Some(false));
+    assert!(text.contains("built-in default"), "{text}");
+}
+
+#[test]
+fn config_list_validates_global_even_when_project_wins() {
+    let f = Fixture::new();
+    let global = f.playpen_conf(true, "host_engine = \"false\"\n");
+    f.playpen_conf(false, "host_engine = true\n");
+    for args in [vec!["config", "list"], vec!["config", "--global", "list"]] {
+        let out = f.run(&args);
+        assert!(!out.status.success());
+        assert!(f.stdout(&out).is_empty());
+        assert!(f.stderr(&out).contains(&global.display().to_string()));
+    }
+}
+
+#[test]
+fn config_list_rejects_launch_overrides() {
+    let f = Fixture::new();
+    for flag in ["--host-engine", "--no-host-engine"] {
+        let out = f.run(&[flag, "config", "list"]);
+        assert!(!out.status.success());
+        assert!(f.stdout(&out).is_empty());
+        assert!(f.stderr(&out).contains(flag));
+    }
+}
+
+#[test]
+fn config_list_source_paths_cannot_break_toml_output() {
+    let f = Fixture::new();
+    let xdg = f.config.join("line\nhost_engine = false\r");
+    fs::create_dir_all(xdg.join("playpen")).unwrap();
+    fs::write(xdg.join("playpen/playpen.toml"), "host_engine = true\n").unwrap();
+    let out = f
+        .playpen(&["config", "--global", "list"])
+        .env("XDG_CONFIG_HOME", &xdg)
+        .output()
+        .unwrap();
+    f.assert_ok(&out);
+    let listed = f.stdout(&out).parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(listed["host_engine"].as_bool(), Some(true));
+}
+
+#[test]
+fn config_edits_without_engine_and_removal_restores_inherited_value() {
+    let f = Fixture::new();
+    let global = f.config.join("playpen/playpen.toml");
+    let project = f.work.join(".playpen/playpen.toml");
+
+    let out = f.run(&["config", "--global", "set", "host_engine", "true"]);
+    f.assert_ok(&out);
+    let report = f.stdout(&out);
+    assert!(report.contains(&global.display().to_string()), "{report}");
+    assert!(
+        report.contains("host_engine") && report.contains("true"),
+        "{report}"
+    );
+    assert!(fs::read_to_string(&global).unwrap().contains("true"));
+
+    let out = f.run(&["config", "set", "host_engine", "false"]);
+    f.assert_ok(&out);
+    let report = f.stdout(&out);
+    assert!(report.contains(&project.display().to_string()), "{report}");
+    assert!(
+        report.contains("host_engine") && report.contains("false"),
+        "{report}"
+    );
+
+    let out = f.run(&["config", "rm", "host_engine"]);
+    f.assert_ok(&out);
+    let report = f.stdout(&out);
+    assert!(report.contains(&project.display().to_string()), "{report}");
+    assert!(report.contains(&global.display().to_string()), "{report}");
+    assert!(
+        report.contains("host_engine") && report.contains("true"),
+        "{report}"
+    );
+    assert!(!fs::read_to_string(&project)
+        .unwrap_or_default()
+        .contains("host_engine"));
+
+    let out = f.run(&["config", "rm", "host_engine"]);
+    f.assert_ok(&out);
+    if project.exists() {
+        fs::remove_file(&project).unwrap();
+    }
+    let out = f.run(&["config", "rm", "host_engine"]);
+    f.assert_ok(&out);
+    assert!(
+        !project.exists(),
+        "removing an absent key must not create a file"
+    );
+    assert!(!f.args_file.exists());
+
+    f.stub_engine("docker");
+    f.seed_fresh("playpen-base");
+    let sock_dir = f.home.join(".docker/run");
+    fs::create_dir_all(&sock_dir).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(sock_dir.join("docker.sock")).unwrap();
+    let out = f.run_with(&[], &[("PLAYPEN_ENGINE", "docker")]);
+    f.assert_ok(&out);
+    f.assert_host_engine(true);
+}
+
+#[test]
+fn config_edits_preserve_comments() {
+    let f = Fixture::new();
+    let path = f.playpen_conf(
+        false,
+        "# project policy\n\nhost_engine = false # local override\n\n# keep this footer\n",
+    );
+    let out = f.run(&["config", "set", "host_engine", "true"]);
+    f.assert_ok(&out);
+    let edited = fs::read_to_string(&path).unwrap();
+    for comment in ["# project policy", "# local override", "# keep this footer"] {
+        assert!(edited.contains(comment), "{edited}");
+    }
+    assert!(edited.contains("true"), "{edited}");
+
+    let out = f.run(&["config", "rm", "host_engine"]);
+    f.assert_ok(&out);
+    let edited = fs::read_to_string(&path).unwrap();
+    for comment in ["# project policy", "# local override", "# keep this footer"] {
+        assert!(edited.contains(comment), "{edited}");
+    }
+    assert!(!edited.contains("host_engine"), "{edited}");
+}
+
+#[test]
+fn config_rejects_invalid_edits_without_engine_or_file_creation() {
+    let f = Fixture::new();
+    let project = f.work.join(".playpen/playpen.toml");
+    for value in ["1", "yes", "TRUE", "False", ""] {
+        let out = f.run(&["config", "set", "host_engine", value]);
+        assert!(!out.status.success(), "accepted {value:?}");
+        assert!(f.stderr(&out).contains("host_engine"), "{}", f.stderr(&out));
+        assert!(!project.exists());
+    }
+    for args in [
+        vec!["config", "set", "unknown_option", "true"],
+        vec!["config", "rm", "unknown_option"],
+    ] {
+        let out = f.run(&args);
+        assert!(!out.status.success());
+        assert!(
+            f.stderr(&out).contains("unknown_option"),
+            "{}",
+            f.stderr(&out)
+        );
+        assert!(!project.exists());
+    }
+}
+
+#[test]
+fn invalid_config_files_fail_before_engine_even_when_overridden() {
+    for global in [false, true] {
+        for content in [
+            "host_engine = \"true\"\n",
+            "unknown_option = true\n",
+            "host_engine = [\n",
+        ] {
+            let f = Fixture::new();
+            let path = f.playpen_conf(global, content);
+            if global {
+                f.playpen_conf(false, "host_engine = false\n");
+            }
+            for args in [
+                vec!["--no-host-engine"],
+                vec!["config", "set", "host_engine", "false"],
+            ] {
+                let out = f.run(&args);
+                assert!(!out.status.success(), "accepted {content:?}");
+                let stderr = f.stderr(&out);
+                assert!(stderr.contains(&path.display().to_string()), "{stderr}");
+                assert_eq!(fs::read_to_string(&path).unwrap(), content);
+                assert!(!f.args_file.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn config_discovery_from_git_subdirectory_keeps_workspace_at_cwd() {
+    for git_file in [false, true] {
+        let f = Fixture::new();
+        f.stub_engine("docker");
+        f.seed_fresh("playpen-base");
+        if git_file {
+            fs::write(f.work.join(".git"), "gitdir: elsewhere\n").unwrap();
+        } else {
+            fs::create_dir(f.work.join(".git")).unwrap();
+        }
+        let project = f.playpen_conf(false, "host_engine = true\n");
+        let cwd = f.work.join("src/nested");
+        fs::create_dir_all(&cwd).unwrap();
+        let sock_dir = f.home.join(".docker/run");
+        fs::create_dir_all(&sock_dir).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(sock_dir.join("docker.sock")).unwrap();
+        let out = f
+            .playpen(&[])
+            .current_dir(&cwd)
+            .env("PWD", &cwd)
+            .env("PLAYPEN_ENGINE", "docker")
+            .output()
+            .unwrap();
+        f.assert_ok(&out);
+        f.assert_host_engine(true);
+        assert!(
+            f.argv()
+                .iter()
+                .any(|arg| arg.starts_with(&format!("{}:/workspace", cwd.display()))),
+            "cwd remains the mounted workspace: {:?}",
+            f.argv()
+        );
+        assert!(!f.argv().iter().any(|arg| {
+            arg.starts_with(&format!(
+                "{}:/workspace",
+                project.parent().unwrap().parent().unwrap().display()
+            ))
+        }));
+    }
+}
+
+#[test]
+fn config_set_from_subdirectory_targets_git_root_when_no_config_exists() {
+    let f = Fixture::new();
+    fs::create_dir(f.work.join(".git")).unwrap();
+    let cwd = f.work.join("src/nested");
+    fs::create_dir_all(&cwd).unwrap();
+    let out = f
+        .playpen(&["config", "set", "host_engine", "true"])
+        .current_dir(&cwd)
+        .env("PWD", &cwd)
+        .output()
+        .unwrap();
+    f.assert_ok(&out);
+    let target = f.work.join(".playpen/playpen.toml");
+    assert!(fs::read_to_string(&target).unwrap().contains("true"));
+    assert!(!cwd.join(".playpen/playpen.toml").exists());
+    assert!(f.stdout(&out).contains(&target.display().to_string()));
+}
+
+#[test]
+fn nearest_project_config_does_not_merge_ancestor_project_values() {
+    let f = Fixture::new();
+    f.stub_engine("docker");
+    f.seed_fresh("playpen-base");
+    fs::create_dir(f.work.join(".git")).unwrap();
+    f.playpen_conf(true, "host_engine = false\n");
+    f.playpen_conf(false, "host_engine = true\n");
+    let cwd = f.work.join("nested");
+    fs::create_dir_all(cwd.join(".playpen")).unwrap();
+    fs::write(
+        cwd.join(".playpen/playpen.toml"),
+        "# inherit global, not parent\n",
+    )
+    .unwrap();
+    let out = f
+        .playpen(&[])
+        .current_dir(&cwd)
+        .env("PWD", &cwd)
+        .env("PLAYPEN_ENGINE", "docker")
+        .output()
+        .unwrap();
+    f.assert_ok(&out);
+    f.assert_host_engine(false);
 }
 
 #[test]

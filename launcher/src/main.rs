@@ -5,6 +5,7 @@
 
 mod argv;
 mod cli;
+mod config;
 mod engine;
 mod harness;
 mod host;
@@ -30,18 +31,47 @@ fn main() -> ExitCode {
         Action::Update { harness } => {
             images::refresh(&host, engine::select(&host), harness.as_deref())
         }
+        Action::Config { global, cmd } => {
+            let result = match cmd {
+                cli::ConfigSub::Set { key, value } => {
+                    config::edit(&host, global, &key, Some(&value))
+                }
+                cli::ConfigSub::Rm { key } => config::edit(&host, global, &key, None),
+                cli::ConfigSub::List => config::list(&host, global),
+            };
+            match result {
+                Ok(report) => {
+                    print!("{report}");
+                    if !report.ends_with('\n') {
+                        println!();
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("playpen: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Action::Run(config) => run(&host, config),
     }
 }
 
 fn run(host: &Host, config: Config) -> ExitCode {
+    let settings = match config::resolve(host, config.host_engine) {
+        Ok(settings) => settings,
+        Err(err) => {
+            eprintln!("playpen: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let engine = engine::select(host);
     let harness = harness::resolve(host, config.harness.as_deref());
     let plan = images::plan(&config.image, harness.name);
 
     // Fail fast on a missing host-engine socket, before any build work;
     // the boundary warning also precedes the (streamed) build output.
-    let engine_args = host_engine_args(host, &config, engine);
+    let engine_args = host_engine_args(host, settings.host_engine, engine);
 
     let image = match plan {
         images::Plan::Layered { flavor, target } => {
@@ -97,8 +127,8 @@ fn command(config: &Config, harness: &Harness) -> Vec<OsString> {
     vec![OsString::from(harness.exec)]
 }
 
-fn host_engine_args(host: &Host, config: &Config, engine: engine::Engine) -> Vec<OsString> {
-    if !config.host_engine {
+fn host_engine_args(host: &Host, enabled: bool, engine: engine::Engine) -> Vec<OsString> {
+    if !enabled {
         return Vec::new();
     }
     // Socket diagnostics (and exit) first, then the boundary warning - the
@@ -128,7 +158,7 @@ mod tests {
 
     fn config(shell: bool, command: &[&str]) -> Config {
         Config {
-            host_engine: false,
+            host_engine: None,
             keys_file: PathBuf::new(),
             keys_explicit: false,
             harness: None,

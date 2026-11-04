@@ -492,7 +492,6 @@ mod tests {
             workspace: std::path::PathBuf::from("/work"),
             engine_pref: None,
             registry_pref: None,
-            host_engine_env: false,
             path: Default::default(),
         }
     }

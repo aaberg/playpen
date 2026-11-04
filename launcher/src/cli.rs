@@ -22,7 +22,6 @@ use crate::host::Host;
                   home that persists on the host.",
     after_help = "Environment:\n  \
         PLAYPEN_ENGINE          force the container engine: podman or docker\n  \
-        PLAYPEN_HOST_ENGINE     same as --host-engine when set to 1, true or yes\n  \
         PLAYPEN_REGISTRY        registry flavor images are pulled from when\n  \
         \x20                       missing locally [default: ghcr.io/aaberg]\n\n\
         Keys file (override with --keys FILE):\n  \
@@ -30,6 +29,10 @@ use crate::host::Host;
         or an op:// reference resolved with the 1Password CLI at launch.\n\n\
         Harness selection (override with --harness NAME):\n  \
         ~/.config/playpen/harness.conf - set by `playpen harness`\n\n\
+        Launch configuration (flags override project, then global settings):\n  \
+        .playpen/playpen.toml - nearest project file within Git/home boundary\n  \
+        $XDG_CONFIG_HOME/playpen/playpen.toml [fallback: ~/.config/playpen/playpen.toml]\n  \
+        `host_engine = true` grants host access; --no-host-engine disables it\n\n\
         Bare playpen-* images get a thin harness layer (playpen-jvm ->\n  \
         playpen-jvm:omp), built on demand; tagged or foreign images run as-is.\n\n\
         Examples:\n  \
@@ -37,14 +40,22 @@ use crate::host::Host;
         playpen --shell playpen-jvm              bash in the JVM flavor\n  \
         playpen playpen-jvm -- omp --version     one-off command\n  \
         playpen --host-engine playpen-rust       grant host engine access\n  \
+        playpen --no-host-engine playpen-rust    disable configured host access\n  \
+        playpen config set host_engine true     enable access for this project\n  \
+        playpen config --global rm host_engine  remove the global override\n  \
+        playpen config list                     show effective settings + sources\n  \
         playpen harness                          pick the default harness\n  \
         playpen harness update                   refresh installed harnesses\n  \
         playpen update                           re-pull flavors + rebuild layers"
 )]
 pub struct Cli {
     /// Mount the host container engine socket (trusted projects only)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_host_engine")]
     pub host_engine: bool,
+
+    /// Disable host engine access, overriding project and global settings
+    #[arg(long)]
+    pub no_host_engine: bool,
 
     /// API keys file [default: ~/.config/playpen/keys.conf]
     #[arg(long, value_name = "FILE")]
@@ -82,6 +93,14 @@ pub enum Sub {
     },
     /// Re-pull flavor images from the registry and rebuild harness layers
     Update,
+    /// Inspect or edit configuration (use --global for user-wide settings)
+    Config {
+        /// Use global configuration only, instead of project scope
+        #[arg(long, global = true)]
+        global: bool,
+        #[command(subcommand)]
+        cmd: ConfigSub,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -94,7 +113,17 @@ pub enum HarnessSub {
     },
 }
 
-/// What the user asked for, fully resolved.
+#[derive(Subcommand, Debug)]
+pub enum ConfigSub {
+    /// Set a configuration key (host_engine accepts true or false)
+    Set { key: String, value: String },
+    /// Remove a key from this scope, revealing any inherited value
+    Rm { key: String },
+    /// List effective settings as TOML with source comments
+    List,
+}
+
+/// The requested action, with launch file settings resolved before execution.
 #[derive(Debug)]
 pub enum Action {
     /// A container run.
@@ -106,13 +135,15 @@ pub enum Action {
     /// `playpen update`: re-pull flavors + rebuild harness layers. The
     /// `--harness` flag carries the same override it does for a run.
     Update { harness: Option<String> },
+    /// Inspect or edit project/global TOML configuration.
+    Config { global: bool, cmd: ConfigSub },
 }
 
-/// The resolved launch configuration. The container command is resolved in
-/// main, where the harness (and its exec name) is known.
+/// Launch options. File settings are resolved in main before engine selection.
+/// The container command is resolved where the harness is known.
 #[derive(Debug)]
 pub struct Config {
-    pub host_engine: bool,
+    pub host_engine: Option<bool>,
     pub keys_file: PathBuf,
     pub keys_explicit: bool,
     /// The `--harness` flag, when given.
@@ -196,6 +227,15 @@ fn resolve(cli: Cli, host: &Host) -> Action {
                 harness: cli.harness,
             }
         }
+        Some(Sub::Config { global, cmd }) => {
+            if matches!(cmd, ConfigSub::List) && (cli.host_engine || cli.no_host_engine) {
+                eprintln!(
+                    "playpen: config list cannot be combined with --host-engine or --no-host-engine"
+                );
+                exit(1);
+            }
+            return Action::Config { global, cmd };
+        }
         None => {}
     }
     if cli.shell && !cli.command.is_empty() {
@@ -208,7 +248,13 @@ fn resolve(cli: Cli, host: &Host) -> Action {
         None => (host.default_keys_file(), false),
     };
     Action::Run(Config {
-        host_engine: cli.host_engine || host.host_engine_env,
+        host_engine: if cli.host_engine {
+            Some(true)
+        } else if cli.no_host_engine {
+            Some(false)
+        } else {
+            None
+        },
         keys_file,
         keys_explicit,
         harness: cli.harness,
@@ -334,7 +380,6 @@ mod tests {
             workspace: PathBuf::from("/work"),
             engine_pref: None,
             registry_pref: None,
-            host_engine_env: false,
             path: Default::default(),
         }
     }
@@ -342,6 +387,7 @@ mod tests {
     fn cli(shell: bool, image: &str, command: Vec<OsString>) -> Cli {
         Cli {
             host_engine: false,
+            no_host_engine: false,
             keys: None,
             shell,
             harness: None,
@@ -458,30 +504,5 @@ mod tests {
             PathBuf::from("/home/tester/.config/playpen/keys.conf")
         );
         assert!(!cfg.keys_explicit);
-    }
-
-    #[test]
-    fn host_engine_env_is_honored() {
-        let mut h = host();
-        h.host_engine_env = true;
-        let Action::Run(cfg) = resolve(cli(false, "playpen-base", vec![]), &h) else {
-            panic!("expected run");
-        };
-        assert!(cfg.host_engine);
-
-        let mut h = host();
-        h.host_engine_env = false;
-        let c = Cli {
-            host_engine: true,
-            ..cli(false, "playpen-base", vec![])
-        };
-        let Action::Run(cfg) = resolve(c, &h) else {
-            panic!("expected run");
-        };
-        assert!(cfg.host_engine);
-        let Action::Run(cfg) = resolve(cli(false, "playpen-base", vec![]), &h) else {
-            panic!("expected run");
-        };
-        assert!(!cfg.host_engine);
     }
 }

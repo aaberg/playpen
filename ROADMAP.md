@@ -74,8 +74,9 @@ Rough budget: launcher ~700 lines, install.sh ~100, CI ~150 lines YAML.
 
 Reproduce `bin/playpen` exactly, as a crate in `launcher/`:
 
-- CLI: `--host-engine` (+`PLAYPEN_HOST_ENGINE`), `--keys FILE`, `--shell`,
-  image positional (default `playpen-base`), `-- CMD` passthrough, `-h`.
+- CLI: `--host-engine` / `--no-host-engine`, project/global `config set/rm/list`,
+  `--keys FILE`, `--shell`, image positional (default `playpen-base`),
+  `-- CMD` passthrough, `-h`.
 - Engine selection: `PLAYPEN_ENGINE` or autodetect podman -> docker.
 - keys.conf: `NAME=value`, `#`-comments, CRLF tolerated, 0600 tightening,
   `op read` for `op://` values, temp 0600 env-file removed on exit.

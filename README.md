@@ -68,6 +68,7 @@ playpen playpen-rust    # Rust project (runs playpen-rust:omp)
 playpen playpen-jvm     # JVM/Kotlin project
 playpen                 # no flavor: plain base
 playpen --host-engine playpen-rust   # trusted project: + host engine socket
+playpen --no-host-engine playpen-rust # disable configured host engine access
 playpen --shell playpen-rust         # bash prompt in the harness image
 playpen playpen-jvm -- omp --version # any other command inside
 playpen update          # re-pull flavors from ghcr.io + rebuild layers
@@ -82,6 +83,90 @@ Inside the container, the agent runs in yolo mode: its $HOME is
 `~/.local/share/playpen-home` on your disk - expendable by design. The sandbox
 boundary is the container's mounts - by default just the workspace and
 the agent home.
+
+## Configuration
+
+Project settings live in `<project-root>/.playpen/playpen.toml`. Global settings
+live in `$XDG_CONFIG_HOME/playpen/playpen.toml`, falling back to
+`$HOME/.config/playpen/playpen.toml` when `XDG_CONFIG_HOME` is unset, empty,
+or relative. The same fallback applies on Linux, WSL, and macOS; it does not
+depend on the variable being set by the operating system.
+
+The first supported setting is a TOML boolean:
+
+```toml
+host_engine = true
+```
+
+Edit configuration without opening the file:
+
+```bash
+playpen config set host_engine true          # enable for this project
+playpen config set host_engine false         # explicitly disable for this project
+playpen config rm host_engine                # remove the project override
+playpen config --global set host_engine true # enable globally
+playpen config --global rm host_engine       # remove the global override
+```
+
+Each command reports the selected file and effective value/source. Commands
+work without a container engine. `set` creates missing directories/files;
+`rm` is idempotent and does not create missing files. Edits are atomic and
+preserve comments and existing file permissions.
+
+Inspect effective configuration:
+
+```bash
+playpen config list          # project > global > built-in defaults
+playpen config --global list # global > built-in defaults; ignore the project
+```
+
+The output is merged TOML: each setting appears once, with its winning source
+in a comment. For example:
+
+```toml
+# source: "/home/alice/myproject/.playpen/playpen.toml"
+host_engine = false
+```
+
+Defaults are included even when no configuration files exist. Listing is
+read-only and creates no files or directories. Global-only listing does not
+discover or validate project configuration, so an invalid project file does
+not block it. Both commands validate the configuration layers they do load.
+Output describes persistent settings and defaults, not launch overrides:
+`--host-engine` and `--no-host-engine` cannot be combined with `config list`.
+
+Precedence, highest first:
+
+1. Explicit `--host-engine` or `--no-host-engine` launch flag (mutually exclusive).
+2. Project `host_engine`, including an explicit `false`.
+3. Global `host_engine`.
+4. Built-in default: `false`.
+
+Removing a key means **inherit**, not disable: removing a project `false` can
+re-enable access if the global value is `true`. Use `set host_engine false`
+or `--no-host-engine` to disable it explicitly.
+
+Discovery starts at the working directory and walks upward to the nearest
+Git root (`.git` directory or worktree file) or home-directory boundary,
+including that boundary. Outside the home directory and Git, discovery can
+reach the filesystem root. Only the nearest existing `.playpen/playpen.toml`
+is loaded; ancestor project files are not merged. If none exists, project
+edits target the Git root, or the working directory outside Git. Discovery
+does not change the working directory mounted at `/workspace`.
+
+Missing files mean no overrides. Invalid TOML, unknown keys, and non-boolean
+`host_engine` values fail with a file diagnostic, even if a higher-priority
+setting would override them. CLI values must be exactly `true` or `false`.
+Configuration commands validate both selected layers before writing.
+
+Project configuration is trusted automatically: a cloned or modified file can
+enable host-engine access without approval. The launch warning is informational,
+not an approval prompt. Review project configuration before launching untrusted
+code; a gitignored file can still be modified by code inside the mounted project.
+
+`PLAYPEN_HOST_ENGINE` is no longer read. Replace shell/direnv exports with the
+project or global commands above. Other environment settings and the existing
+keys/harness configuration files are unchanged.
 
 ## Harnesses
 
@@ -143,9 +228,9 @@ The agent itself is a thin image layer the launcher builds and maintains:
   per-project key set. Literal values are plaintext in the config file -
   keep it mode 0600 (the launcher tightens it if looser) and prefer
   `op://`.
-- Host engine access (Podman or Docker, for Testcontainers etc.) is opt-in per launch:
-  `playpen --host-engine <flavor>` or `PLAYPEN_HOST_ENGINE=1` (per-project
-  via direnv). It mounts the host engine socket and sets `DOCKER_HOST`
+- Host engine access (Podman or Docker, for Testcontainers etc.) is disabled by
+  default. Enable it with `playpen --host-engine <flavor>` or `host_engine = true`
+  in [configuration](#configuration). It mounts the host engine socket and sets `DOCKER_HOST`
   (plus `CONTAINER_HOST` for Podman). Both engines also receive
   `--security-opt label=disable` so SELinux permits access to the host socket;
   normal launches retain SELinux label confinement and get no engine socket.
