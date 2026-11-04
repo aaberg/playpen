@@ -104,7 +104,8 @@ pub fn host_socket(engine: Engine, host: &Host) -> PathBuf {
 /// CONTAINER_HOST (podman only).
 /// Disable SELinux label confinement so the mounted host socket is accessible.
 pub fn host_engine_args(engine: Engine, socket: &Path) -> Vec<OsString> {
-    let mut args = vec![
+    let mut args = Vec::with_capacity(8);
+    args.extend([
         OsString::from("--security-opt"),
         OsString::from("label=disable"),
         OsString::from("-v"),
@@ -115,12 +116,24 @@ pub fn host_engine_args(engine: Engine, socket: &Path) -> Vec<OsString> {
         },
         OsString::from("-e"),
         OsString::from("DOCKER_HOST=unix:///run/host-engine.sock"),
-    ];
+    ]);
     if engine == Engine::Podman {
         args.push(OsString::from("-e"));
         args.push(OsString::from(
             "CONTAINER_HOST=unix:///run/host-engine.sock",
         ));
+    } else {
+        use std::os::unix::fs::MetadataExt;
+
+        // --user does not inherit the host user's supplementary docker group.
+        let metadata = std::fs::metadata(socket).unwrap_or_else(|err| {
+            signals::fail(format!(
+                "playpen: cannot stat host engine socket {}: {err}",
+                socket.display()
+            ))
+        });
+        args.push(OsString::from("--group-add"));
+        args.push(OsString::from(metadata.gid().to_string()));
     }
     args
 }

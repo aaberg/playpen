@@ -15,7 +15,7 @@ engine: `make all ENGINE=docker`.
 ```
 base/                playpen-base: Fedora, git, bash, node, bun, agent user
 flavors/rust/        playpen-rust: rustup toolchain, sccache, native build deps
-flavors/jvm/         playpen-jvm: JDK LTS, Maven, standalone Kotlin compiler
+flavors/jvm/         playpen-jvm: JDK LTS, Maven, Kotlin compiler, Kotlin/Java LSPs
 launcher/            Rust launcher crate (binary: playpen)
 install.sh           curl-installer for the released musl binary
 .github/workflows    PR/main validation and release-only multi-arch publication
@@ -206,10 +206,22 @@ The agent itself is a thin image layer the launcher builds and maintains:
   `playpen-cargo` (only for `playpen-rust`), so the registry cache and
   `cargo install`-ed tools persist across sessions. sccache is wired in via `RUSTC_WRAPPER`; its cache lives
   under the persistent agent home, so clean rebuilds stay fast.
-- JVM: JDK 25 (LTS) via `java-25-openjdk-devel`; change `JDK_VERSION` in
-  `flavors/jvm/Containerfile` for another line (e.g. 21). Gradle projects
-  rely on their wrapper; Maven covers wrapper-less builds. Standalone
-  `kotlinc` is for scripts and quick experiments.
+- JVM: JDK 25 (LTS) via `java-25-openjdk-devel`. Gradle projects rely on
+  their wrapper; Maven covers wrapper-less builds. Standalone `kotlinc` is
+  for scripts and quick experiments. The image also includes JetBrains
+  [`kotlin-lsp`](https://github.com/Kotlin/kotlin-lsp) 263.7084.0 and Eclipse
+  [`jdtls`](https://github.com/eclipse-jdtls/eclipse.jdt.ls) 1.63.0 on `PATH`.
+  Both downloads are pinned and SHA-256 checked, with Linux amd64/arm64
+  selection. Kotlin LSP is alpha and includes its own JetBrains Runtime;
+  JDT LS uses the image's JDK, which must remain compatible if changing
+  `JDK_VERSION` in `flavors/jvm/Containerfile`. Updating Kotlin LSP requires
+  updating both architecture checksums; updating JDT LS requires its version,
+  build timestamp, and checksum.
+  The launchers set JVM `user.home` from `$HOME` for numeric host UIDs.
+  JDT LS writes configuration and workspace data under
+  `${XDG_CACHE_HOME:-$HOME/.cache}/jdtls/<workspace-path-sha256>/`, not `/opt`.
+  omp auto-detects both commands in projects with recognized Maven/Gradle
+  root markers; no extra LSP configuration is needed for those projects.
 - User mapping: podman `--userns=keep-id` plus explicit `--user $UID:$GID`;
   docker `--user $UID:$GID`. Files the agent creates are owned by you on the
   host, even when your UID differs from the image's agent UID. Images set
@@ -234,6 +246,19 @@ The agent itself is a thin image layer the launcher builds and maintains:
   (plus `CONTAINER_HOST` for Podman). Both engines also receive
   `--security-opt label=disable` so SELinux permits access to the host socket;
   normal launches retain SELinux label confinement and get no engine socket.
+  Images include both the real Docker CLI and Podman: use `docker ps` /
+  `docker run` with either host engine, or `podman ps` / `podman run` with a
+  Podman host. Podman's CLI cannot control Docker. Docker launches add the
+  socket's numeric GID as a supplementary group for the non-root container user;
+  other host supplementary groups are not forwarded.
+  The launcher prefers Podman when both engines are installed; set
+  `PLAYPEN_ENGINE=docker` to select Docker explicitly. Socket discovery uses
+  `/run/user/$UID/podman/podman.sock` for Podman, or
+  `~/.docker/run/docker.sock` then `/var/run/docker.sock` for Docker.
+  Docker contexts, custom `DOCKER_HOST` endpoints, and other rootless Docker
+  socket locations are not discovered.
+  Sibling bind-mount source paths refer to the engine host, not the agent's
+  `/workspace`; published ports belong to that host as well.
   With host-engine access, code inside can create sibling containers that
   mount files accessible to the engine service user and inspect every container
   on that engine. Rootless Podman grants your host user's access; rootful Docker
@@ -249,12 +274,19 @@ launcher's unit and stub-engine integration tests on native amd64/arm64
 runners. A Docker/Podman matrix builds all images and exercises the actual
 launcher extracted from each musl release tarball.
 
+On Ubuntu 26.04, CI and release Podman setup also allow Podman's `SIGTERM` to
+the `pasta` networking helper in AppArmor and reload its profile before starting
+the API socket. This narrow workaround addresses rootless network cleanup
+failures tracked in [runner-images#15182](https://github.com/actions/runner-images/issues/15182).
+
 The credential-free smoke runner compiles and runs Rust, Java, and Kotlin
 examples, checks workspace/home mounts and file ownership, verifies dummy-key
 handling and exit status propagation, and builds/reuses a real omp harness
-layer. It uses a pseudo-terminal because the launcher is interactive. Its
-temporary configuration, image aliases, and cargo volume are removed afterward;
-it does not use your API keys or call an AI provider.
+layer. It also verifies `docker ps` and a sibling-container workload through
+the forwarded socket on both engines, plus Podman's native remote CLI on Podman.
+It uses a pseudo-terminal because the launcher is interactive. Its temporary
+configuration, image aliases, sibling containers, and cargo volume are removed
+afterward; it does not use your API keys or call an AI provider.
 
 Run the same checks locally with a real engine:
 
@@ -262,6 +294,7 @@ Run the same checks locally with a real engine:
 make test
 make all ENGINE=podman
 cargo build --release --locked --manifest-path launcher/Cargo.toml
+systemctl --user start podman.socket
 python3 scripts/smoke.py --engine podman --launcher launcher/target/release/playpen
 # For Docker, build images with ENGINE=docker and use --engine docker.
 ```

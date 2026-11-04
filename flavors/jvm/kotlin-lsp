@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -eu
+
+# The bundled JVM otherwise guesses user.home for UIDs absent from /etc/passwd.
+export IJ_JAVA_OPTIONS="${IJ_JAVA_OPTIONS:+${IJ_JAVA_OPTIONS} }-Duser.home=${HOME}"
+exec /opt/kotlin-lsp/bin/intellij-server "$@"
