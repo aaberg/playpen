@@ -184,10 +184,12 @@ jobs:
         if: matrix.engine == 'podman'
         run: |
           sudo apt-get update
-          sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+          sudo apt-get install -y podman uidmap slirp4netns fuse-overlayfs dbus-user-session
           if test -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          systemctl --user start podman.socket
+          test -S "/run/user/$(id -u)/podman/podman.sock"
       - name: Verify anonymous versioned pulls on native architecture
         env:
           ENGINE: ${{ matrix.engine }}

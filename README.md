@@ -234,6 +234,19 @@ The agent itself is a thin image layer the launcher builds and maintains:
   (plus `CONTAINER_HOST` for Podman). Both engines also receive
   `--security-opt label=disable` so SELinux permits access to the host socket;
   normal launches retain SELinux label confinement and get no engine socket.
+  Images include both the real Docker CLI and Podman: use `docker ps` /
+  `docker run` with either host engine, or `podman ps` / `podman run` with a
+  Podman host. Podman's CLI cannot control Docker. Docker launches add the
+  socket's numeric GID as a supplementary group for the non-root container user;
+  other host supplementary groups are not forwarded.
+  The launcher prefers Podman when both engines are installed; set
+  `PLAYPEN_ENGINE=docker` to select Docker explicitly. Socket discovery uses
+  `/run/user/$UID/podman/podman.sock` for Podman, or
+  `~/.docker/run/docker.sock` then `/var/run/docker.sock` for Docker.
+  Docker contexts, custom `DOCKER_HOST` endpoints, and other rootless Docker
+  socket locations are not discovered.
+  Sibling bind-mount source paths refer to the engine host, not the agent's
+  `/workspace`; published ports belong to that host as well.
   With host-engine access, code inside can create sibling containers that
   mount files accessible to the engine service user and inspect every container
   on that engine. Rootless Podman grants your host user's access; rootful Docker
@@ -252,9 +265,11 @@ launcher extracted from each musl release tarball.
 The credential-free smoke runner compiles and runs Rust, Java, and Kotlin
 examples, checks workspace/home mounts and file ownership, verifies dummy-key
 handling and exit status propagation, and builds/reuses a real omp harness
-layer. It uses a pseudo-terminal because the launcher is interactive. Its
-temporary configuration, image aliases, and cargo volume are removed afterward;
-it does not use your API keys or call an AI provider.
+layer. It also verifies `docker ps` and a sibling-container workload through
+the forwarded socket on both engines, plus Podman's native remote CLI on Podman.
+It uses a pseudo-terminal because the launcher is interactive. Its temporary
+configuration, image aliases, sibling containers, and cargo volume are removed
+afterward; it does not use your API keys or call an AI provider.
 
 Run the same checks locally with a real engine:
 
@@ -262,6 +277,7 @@ Run the same checks locally with a real engine:
 make test
 make all ENGINE=podman
 cargo build --release --locked --manifest-path launcher/Cargo.toml
+systemctl --user start podman.socket
 python3 scripts/smoke.py --engine podman --launcher launcher/target/release/playpen
 # For Docker, build images with ENGINE=docker and use --engine docker.
 ```

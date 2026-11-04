@@ -6,8 +6,10 @@ playpen-{base,rust,jvm}:latest:
 
     python3 scripts/smoke.py --engine docker --launcher /path/to/playpen
 
-Podman uses the same invocation with --engine podman. No AI requests are made;
-only a dummy secret is supplied. The harness install needs npm network access.
+Podman uses the same invocation with --engine podman; start its rootless API socket
+first with systemctl --user start podman.socket. Both isolated and opt-in host
+engine launches are exercised. No AI requests are made; only a dummy secret is
+supplied. The harness install needs npm network access.
 All launcher state, image aliases, and the cargo volume belong to this run. The
 forwarding executable restores the engine's original environment (in particular
 HOME and XDG storage/config paths). It substitutes the cargo volume name and
@@ -188,6 +190,7 @@ class Smoke:
         self.token = "smoke-" + uuid.uuid4().hex[:16]
         self.volume = "playpen-cargo-" + self.token
         self.aliases = []
+        self.siblings = set()
         self.log = root / "engine.jsonl"
         self.workspace = root / "workspace"
         self.home = root / "home"
@@ -265,11 +268,13 @@ class Smoke:
         )
         require(name not in output.splitlines(), f"--rm left container {name}")
 
-    def launch(self, image, command, *, timeout=120, expected=0, explicit_keys=False):
+    def launch(self, image, command, *, timeout=120, expected=0, explicit_keys=False, host_engine=False):
         before = len(self.events())
         args = [self.launcher]
         if explicit_keys:
             args.extend(["--keys", self.keys])
+        if host_engine:
+            args.append("--host-engine")
         args.extend([image, "--", *command])
         _, output = run(
             args, env=self.launcher_env, cwd=self.workspace, tty=True,
@@ -299,6 +304,71 @@ class Smoke:
                 (info.st_uid, info.st_gid) == (os.getuid(), os.getgid()),
                 f"wrong host ownership for {path}: {info.st_uid}:{info.st_gid}",
             )
+
+    def host_engine_access(self, image):
+        if self.engine_name == "docker":
+            # The launcher intentionally sees an isolated HOME. Preserve its
+            # supported discovery order without exposing the user's config.
+            sockets = (
+                Path(self.engine_env.get("HOME", str(Path.home()))) / ".docker/run/docker.sock",
+                Path("/var/run/docker.sock"),
+            )
+            socket = next((path for path in sockets if path.is_socket()), None)
+            require(socket is not None, "host-engine smoke needs ~/.docker/run/docker.sock or /var/run/docker.sock")
+            isolated_socket = self.home / ".docker/run/docker.sock"
+            isolated_socket.parent.mkdir(parents=True)
+            isolated_socket.symlink_to(socket.resolve(strict=True))
+        else:
+            socket = Path(f"/run/user/{os.getuid()}/podman/podman.sock")
+            require(
+                socket.is_socket(),
+                "host-engine smoke needs systemctl --user start podman.socket",
+            )
+
+        sibling = "playpen-sibling-" + self.token
+        # Register before launching: an interrupted docker client can leave a
+        # successfully created sibling even when the launcher itself is gone.
+        self.siblings.add(sibling)
+        script = f'''
+[[ $DOCKER_HOST = unix:///run/host-engine.sock ]]
+[[ -S /run/host-engine.sock ]]
+'''
+        if self.engine_name == "podman":
+            script += '[[ $CONTAINER_HOST = unix:///run/host-engine.sock ]]\n'
+        else:
+            script += '[[ ! -v CONTAINER_HOST ]]\n'
+        script += f'''
+sibling={shlex.quote(sibling)}
+trap 'docker rm -f "$sibling" >/dev/null 2>&1 || true' EXIT
+docker ps
+docker run --detach --pull=never --name "$sibling" {shlex.quote(image)} sleep 120
+names=$(docker ps --filter "name=$sibling" --format '{{{{.Names}}}}')
+printf '%s\\n' "$names"
+[[ $names = "$sibling" ]]
+workload=$(docker exec "$sibling" printf 'SMOKE_SIBLING_OK\\n')
+printf '%s\\n' "$workload"
+[[ $workload = SMOKE_SIBLING_OK ]]
+'''
+        if self.engine_name == "podman":
+            script += '''
+names=$(podman --remote ps --filter "name=$sibling" --format '{{.Names}}')
+printf '%s\\n' "$names"
+[[ $names = "$sibling" ]]
+printf 'SMOKE_PODMAN_REMOTE_OK\\n'
+'''
+        script += '''
+docker rm -f "$sibling"
+names=$(docker ps -a --filter "name=$sibling" --format '{{.Names}}')
+[[ -z $names ]]
+trap - EXIT
+printf 'SMOKE_HOST_ENGINE_OK\\n'
+'''
+        output, _ = self.shell(image, script, host_engine=True)
+        for marker in ("SMOKE_SIBLING_OK", "SMOKE_HOST_ENGINE_OK"):
+            require(marker in output, f"host-engine output missing: {marker}")
+        if self.engine_name == "podman":
+            require("SMOKE_PODMAN_REMOTE_OK" in output, "Podman remote command did not execute")
+        self.assert_removed(sibling)
 
     def exercise(self):
         for flavor in ("base", "rust", "jvm"):
@@ -335,11 +405,12 @@ g++ --version
 make --version
 curl --version
 podman --version
+docker --version
 sqlite3 --version
 printf 'SMOKE_BASE_OK\\n'
 '''
         output, _ = self.shell(raw["base"], boundary + tools, explicit_keys=True)
-        for pattern in (r"git version \d", r"Python 3\.", r"podman version \d", r"SMOKE_BASE_OK"):
+        for pattern in (r"git version \d", r"Python 3\.", r"podman version \d", r"Docker version \d", r"SMOKE_BASE_OK"):
             require(re.search(pattern, output), f"base tool output missing: {pattern}")
         require((self.workspace / "container-workspace").read_text() == "workspace-output\n", "workspace mount did not persist")
         require((self.agent_home / "container-home").read_text() == "home-output\n", "agent-home mount did not persist")
@@ -348,6 +419,7 @@ printf 'SMOKE_BASE_OK\\n'
             raw["base"], boundary + "printf 'SMOKE_EXIT_37\\n'; exit 37", expected=37
         )
         require("SMOKE_EXIT_37" in output, "exit propagation command did not execute")
+        self.host_engine_access(raw["base"])
 
         project = self.workspace / "rust-example"
         (project / "src").mkdir(parents=True)
@@ -410,7 +482,7 @@ java -jar hello.jar
 
     def cleanup(self):
         errors = []
-        names = set()
+        names = set(self.siblings)
         for event in self.events():
             args = event["args"]
             if args[:1] == ["run"] and "--name" in args:
@@ -477,7 +549,7 @@ def main():
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
-    print(f"Smoke passed: {args.engine}; tools, compilers, launcher isolation, exit status, and harness reuse")
+    print(f"Smoke passed: {args.engine}; tools, compilers, launcher isolation, host engine access, sibling cleanup, exit status, and harness reuse")
 
 
 if __name__ == "__main__":

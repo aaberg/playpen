@@ -22,7 +22,7 @@ RUN microdnf -y install \
       gcc gcc-c++ make \
       python3 pipx \
       openssl-devel pkgconf-pkg-config \
-      podman \
+      podman docker-cli \
       sqlite \
     && microdnf clean all
 
