@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Launch JDT LS with writable state isolated by the full workspace path."""
+
+import hashlib
+import os
+from pathlib import Path
+import sys
+
+
+cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+workspace = hashlib.sha256(os.fsencode(Path.cwd())).hexdigest()
+state = cache / "jdtls" / workspace
+state.mkdir(parents=True, exist_ok=True)
+os.execv("/opt/jdtls/bin/jdtls", [
+    "jdtls",
+    f"--jvm-arg=-Duser.home={Path.home()}",
+    "--jvm-arg=-Dosgi.sharedConfiguration.area=/opt/jdtls/config",
+    "-configuration", str(state / "config"),
+    "-data", str(state / "data"),
+    *sys.argv[1:],
+])

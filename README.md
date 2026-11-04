@@ -15,7 +15,7 @@ engine: `make all ENGINE=docker`.
 ```
 base/                playpen-base: Fedora, git, bash, node, bun, agent user
 flavors/rust/        playpen-rust: rustup toolchain, sccache, native build deps
-flavors/jvm/         playpen-jvm: JDK LTS, Maven, standalone Kotlin compiler
+flavors/jvm/         playpen-jvm: JDK LTS, Maven, Kotlin compiler, Kotlin/Java LSPs
 launcher/            Rust launcher crate (binary: playpen)
 install.sh           curl-installer for the released musl binary
 .github/workflows    PR/main validation and release-only multi-arch publication
@@ -206,10 +206,22 @@ The agent itself is a thin image layer the launcher builds and maintains:
   `playpen-cargo` (only for `playpen-rust`), so the registry cache and
   `cargo install`-ed tools persist across sessions. sccache is wired in via `RUSTC_WRAPPER`; its cache lives
   under the persistent agent home, so clean rebuilds stay fast.
-- JVM: JDK 25 (LTS) via `java-25-openjdk-devel`; change `JDK_VERSION` in
-  `flavors/jvm/Containerfile` for another line (e.g. 21). Gradle projects
-  rely on their wrapper; Maven covers wrapper-less builds. Standalone
-  `kotlinc` is for scripts and quick experiments.
+- JVM: JDK 25 (LTS) via `java-25-openjdk-devel`. Gradle projects rely on
+  their wrapper; Maven covers wrapper-less builds. Standalone `kotlinc` is
+  for scripts and quick experiments. The image also includes JetBrains
+  [`kotlin-lsp`](https://github.com/Kotlin/kotlin-lsp) 263.7084.0 and Eclipse
+  [`jdtls`](https://github.com/eclipse-jdtls/eclipse.jdt.ls) 1.63.0 on `PATH`.
+  Both downloads are pinned and SHA-256 checked, with Linux amd64/arm64
+  selection. Kotlin LSP is alpha and includes its own JetBrains Runtime;
+  JDT LS uses the image's JDK, which must remain compatible if changing
+  `JDK_VERSION` in `flavors/jvm/Containerfile`. Updating Kotlin LSP requires
+  updating both architecture checksums; updating JDT LS requires its version,
+  build timestamp, and checksum.
+  The launchers set JVM `user.home` from `$HOME` for numeric host UIDs.
+  JDT LS writes configuration and workspace data under
+  `${XDG_CACHE_HOME:-$HOME/.cache}/jdtls/<workspace-path-sha256>/`, not `/opt`.
+  omp auto-detects both commands in projects with recognized Maven/Gradle
+  root markers; no extra LSP configuration is needed for those projects.
 - User mapping: podman `--userns=keep-id` plus explicit `--user $UID:$GID`;
   docker `--user $UID:$GID`. Files the agent creates are owned by you on the
   host, even when your UID differs from the image's agent UID. Images set

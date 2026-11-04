@@ -24,5 +24,41 @@ RUN curl -fsSL -o /tmp/kotlin.zip \
 
 ENV PATH="/opt/kotlinc/bin:${PATH}"
 
+# Standalone servers, pinned independently of the project's Kotlin/Java versions.
+ARG KOTLIN_LSP_VERSION=263.7084.0
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64) suffix=""; checksum=ae0c4b01e17ab73a4a5227a78ea99e6dcbe3e499600315b22759a4e4cddd11df ;; \
+      aarch64) suffix="-aarch64"; checksum=450ab7c1d80e48106aa429b48cb4226d82ca12a8a2400447ae02386794780cac ;; \
+      *) echo "Unsupported Kotlin LSP architecture" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/kotlin-lsp.tar.gz \
+      "https://download.jetbrains.com/language-server/kotlin-server/${KOTLIN_LSP_VERSION}/kotlin-server-${KOTLIN_LSP_VERSION}${suffix}.tar.gz"; \
+    echo "${checksum}  /tmp/kotlin-lsp.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/kotlin-lsp; \
+    tar -xzf /tmp/kotlin-lsp.tar.gz -C /opt/kotlin-lsp --strip-components=1 --no-same-owner; \
+    rm -f /tmp/kotlin-lsp.tar.gz
+
+ARG JDTLS_VERSION=1.63.0
+ARG JDTLS_BUILD=202610191322
+ARG JDTLS_SHA256=b1f2abe0b3cccb462cf64fb4a5587c7d09df60cf8be7748b152cbd89d018bdc4
+RUN set -eu; \
+    curl -fsSL -o /tmp/jdtls.tar.gz \
+      "https://download.eclipse.org/jdtls/milestones/${JDTLS_VERSION}/jdt-language-server-${JDTLS_VERSION}-${JDTLS_BUILD}.tar.gz"; \
+    echo "${JDTLS_SHA256}  /tmp/jdtls.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/jdtls; \
+    tar -xzf /tmp/jdtls.tar.gz -C /opt/jdtls --no-same-owner; \
+    case "$(uname -m)" in \
+      x86_64) config=config_linux ;; \
+      aarch64) config=config_linux_arm ;; \
+      *) echo "Unsupported JDT LS architecture" >&2; exit 1 ;; \
+    esac; \
+    ln -s "$config" /opt/jdtls/config; \
+    rm -f /tmp/jdtls.tar.gz
+
+# JVM user.home must follow HOME even for numeric UIDs without passwd entries.
+COPY kotlin-lsp jdtls /usr/local/bin/
+RUN chmod +x /usr/local/bin/kotlin-lsp /usr/local/bin/jdtls /opt/jdtls/bin/jdtls
+
 USER agent
 WORKDIR /workspace
