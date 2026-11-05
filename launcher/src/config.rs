@@ -154,7 +154,9 @@ impl File {
     fn load(path: PathBuf) -> Result<Self, String> {
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            Err(err)
+                if err.kind() == io::ErrorKind::NotFound && !configuration_entry_exists(&path)? =>
+            {
                 return Ok(Self {
                     path,
                     document: DocumentMut::new(),
@@ -241,10 +243,8 @@ fn project_path(host: &Host) -> Result<PathBuf, String> {
     let home_boundary = home.as_deref().filter(|home| workspace.starts_with(home));
     for directory in workspace.ancestors() {
         let candidate = directory.join(".playpen/playpen.toml");
-        match fs::metadata(&candidate) {
-            Ok(_) => return Ok(candidate),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(path_error("inspect configuration", &candidate, err)),
+        if configuration_entry_exists(&candidate)? {
+            return Ok(candidate);
         }
         let git = directory.join(".git");
         let is_git_root = match fs::metadata(&git) {
@@ -264,13 +264,33 @@ fn project_path(host: &Host) -> Result<PathBuf, String> {
     Ok(workspace.join(".playpen/playpen.toml"))
 }
 
+// Count dangling symlinks as entries so discovery cannot skip them and writes
+// cannot mistake them for missing files that are safe to create.
+fn configuration_entry_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(path_error("inspect configuration", path, err)),
+    }
+}
+
 fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
-    let parent = path.parent().expect("configuration paths have a parent");
+    let resolved = match fs::canonicalize(path) {
+        Ok(resolved) => Some(resolved),
+        Err(err) if err.kind() == io::ErrorKind::NotFound && !configuration_entry_exists(path)? => {
+            None
+        }
+        Err(err) => return Err(path_error("resolve configuration", path, err)),
+    };
+    let destination = resolved.as_deref().unwrap_or(path);
+    let parent = destination
+        .parent()
+        .expect("configuration paths have a parent");
     fs::create_dir_all(parent)
         .map_err(|err| path_error("create configuration directory", parent, err))?;
     let mut temporary = NamedTempFile::with_prefix_in(".playpen-config.", parent)
         .map_err(|err| path_error("create temporary configuration", path, err))?;
-    match fs::metadata(path) {
+    match fs::metadata(destination) {
         Ok(metadata) => temporary
             .as_file()
             .set_permissions(metadata.permissions())
@@ -286,7 +306,7 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
         .sync_all()
         .map_err(|err| path_error("sync configuration", path, err))?;
     temporary
-        .persist(path)
+        .persist(destination)
         .map_err(|err| path_error("replace configuration", path, err.error))?;
     Ok(())
 }
@@ -529,6 +549,106 @@ mod tests {
         assert!(report.contains(&path.display().to_string()));
         assert!(report.contains("host_engine = true"));
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn edits_follow_configuration_symlinks_preserving_links_and_target_metadata() {
+        for global in [false, true] {
+            for chained in [false, true] {
+                let f = Fixture::new();
+                let path = if global { f.global() } else { f.project() };
+                let target = f.host.home.join("dotfiles/playpen.toml");
+                let original = "# Preference\nhost_engine = false\n# Footer\n";
+                f.put(&target, original);
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let link = if chained {
+                    symlink("playpen.toml", target.with_file_name("alias.toml")).unwrap();
+                    target.with_file_name("alias.toml")
+                } else {
+                    target.clone()
+                };
+                // Both scopes are two directories below HOME.
+                let relative = Path::new("../..").join(link.strip_prefix(&f.host.home).unwrap());
+                symlink(&relative, &path).unwrap();
+                let old_file = fs::File::open(&target).unwrap();
+                let report = edit(&f.host, global, "host_engine", Some("true")).unwrap();
+                assert_eq!(fs::read_link(&path).unwrap(), relative);
+                assert_eq!(
+                    fs::read_to_string(&target).unwrap(),
+                    original.replace("false", "true")
+                );
+                assert_ne!(
+                    fs::metadata(&target).unwrap().ino(),
+                    old_file.metadata().unwrap().ino()
+                );
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    fs::read_to_string(&target).unwrap()
+                );
+                assert_eq!(
+                    fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+                assert!(report.contains(&path.display().to_string()), "{report}");
+                assert_eq!(resolve(&f.host, None).unwrap().source, Some(path.clone()));
+
+                edit(&f.host, global, "host_engine", None).unwrap();
+                assert_eq!(fs::read_link(&path).unwrap(), relative);
+                assert_eq!(
+                    fs::read_to_string(&target).unwrap(),
+                    "# Preference\n# Footer\n"
+                );
+                assert_eq!(
+                    fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+                if chained {
+                    assert_eq!(fs::read_link(&link).unwrap(), Path::new("playpen.toml"));
+                }
+                assert_eq!(
+                    fs::read_dir(target.parent().unwrap()).unwrap().count(),
+                    if chained { 2 } else { 1 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn broken_configuration_links_fail_without_replacement_or_ancestor_edits() {
+        for global in [false, true] {
+            for cyclic in [false, true] {
+                let f = Fixture::new();
+                let ancestor = f.host.home.join(".playpen/playpen.toml");
+                f.put(&ancestor, "host_engine = false\n");
+                let path = if global { f.global() } else { f.project() };
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let target = if cyclic {
+                    path.clone()
+                } else {
+                    f.host.home.join("missing.toml")
+                };
+                symlink(&target, &path).unwrap();
+                for value in [Some("true"), None] {
+                    let error = edit(&f.host, global, "host_engine", value).unwrap_err();
+                    assert!(error.contains(&path.display().to_string()), "{error}");
+                }
+                let error = list(&f.host, global).unwrap_err();
+                assert!(error.contains(&path.display().to_string()), "{error}");
+                // The writer must also reject a link that became broken after loading.
+                let error = atomic_write(&path, "host_engine = true\n").unwrap_err();
+                assert!(error.contains(&path.display().to_string()), "{error}");
+                assert_eq!(fs::read_link(&path).unwrap(), target);
+                assert_eq!(
+                    fs::read_to_string(&ancestor).unwrap(),
+                    "host_engine = false\n"
+                );
+                if !cyclic {
+                    assert!(!target.exists());
+                }
+                assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+            }
+        }
     }
 
     #[test]
