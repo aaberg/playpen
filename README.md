@@ -111,7 +111,9 @@ playpen config --global rm host_engine       # remove the global override
 Each command reports the selected file and effective value/source. Commands
 work without a container engine. `set` creates missing directories/files;
 `rm` is idempotent and does not create missing files. Edits are atomic and
-preserve comments and existing file permissions.
+preserve comments and existing file permissions. Symlinked configuration files
+are updated at their resolved targets without replacing the links. Atomic
+replacement requires write access to the target's directory.
 
 Inspect effective configuration:
 
@@ -154,9 +156,11 @@ is loaded; ancestor project files are not merged. If none exists, project
 edits target the Git root, or the working directory outside Git. Discovery
 does not change the working directory mounted at `/workspace`.
 
-Missing files mean no overrides. Invalid TOML, unknown keys, and non-boolean
-`host_engine` values fail with a file diagnostic, even if a higher-priority
-setting would override them. CLI values must be exactly `true` or `false`.
+Missing files mean no overrides; dangling configuration-file symlinks and
+symlink loops are errors, not missing files. Invalid TOML, unknown keys, and
+non-boolean `host_engine` values fail with a file diagnostic, even if a
+higher-priority setting would override them. CLI values must be exactly
+`true` or `false`.
 Configuration commands validate both selected layers before writing.
 
 Project configuration is trusted automatically: a cloned or modified file can
