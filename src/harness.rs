@@ -1,8 +1,8 @@
 //! The harness layer: a registry of launchable agents (name, npm package
 //! and exec command), the generated Containerfile recipe that installs one
 //! on top of a flavor image, and the `harness.conf` selection file.
-//! Roadmap phase 2: harnesses are thin per-flavor image layers built on
-//! demand by the launcher, never published.
+//! Harnesses are thin per-flavor image layers built on demand by the
+//! launcher, never published.
 
 use std::io::Write;
 
@@ -19,8 +19,8 @@ pub struct Harness {
     pub exec: &'static str,
 }
 
-/// The known harnesses. vibe and opencode join once their exact npm packages
-/// are pinned (roadmap open question).
+/// The currently supported harnesses. Additional harness installation recipes
+/// are planned in ROADMAP.md.
 pub const REGISTRY: &[Harness] = &[Harness {
     name: "omp",
     npm_package: "@oh-my-pi/pi-coding-agent",
@@ -127,11 +127,9 @@ pub fn write_conf(host: &Host, name: &str) -> std::io::Result<()> {
     std::fs::write(&file, updated)
 }
 
-/// The harness-layer Containerfile: FROM the flavor image, install the npm
-/// package exactly the way base/Containerfile used to, back to the agent
-/// user. Built in an empty temp context, so the recipe needs no build
-/// context files; a harness that ever needs some moves to `harness/<name>/`
-/// in the repo (roadmap).
+/// The harness-layer Containerfile: install the npm package on the flavor
+/// image, then return to the agent user. Built in an empty temporary context
+/// because the current recipe needs no additional files.
 pub fn containerfile(flavor: &str, harness: &Harness) -> String {
     format!(
         concat!(

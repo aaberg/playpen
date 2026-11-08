@@ -1,7 +1,6 @@
 //! playpen: launch an AI coding agent inside a sandboxed container.
-//! Phase 1 ported the bash launcher at exact parity; phase 2 makes the
-//! launcher the orchestrator of the harness layers; phase 3 adds pulling
-//! flavor images from the registry when missing locally (see ROADMAP.md).
+//! The launcher resolves configuration, provisions the selected image and
+//! harness, and runs the container through Podman or Docker.
 
 mod argv;
 mod cli;

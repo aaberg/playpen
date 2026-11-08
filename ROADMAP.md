@@ -1,165 +1,184 @@
 # Roadmap
 
-From a personal bash launcher to a distributable tool: pre-built images on
-ghcr.io, the harness as a thin topmost layer, and one static Rust binary
-installed with `curl -fsSL ... | sh`. Phases 1-3 build that; phase 4 adds
-macOS. No native Windows - WSL2 users run the Linux binary inside WSL.
+Playpen is a Rust application that configures, builds, and launches a project's
+agent environment. The target is one installed binary, project-local settings,
+and locally built images rather than Playpen images published to a registry.
 
-## Current state
+This document separates the current implementation from planned behavior.
+[README.md](README.md) documents commands that work today.
 
-- `bin/playpen` (bash): launches omp by default; `--shell` for a bash;
-  `-- CMD` passthrough. podman default, docker supported. Keys from
-  `keys.conf`, literals or `op://` resolved via the 1Password CLI.
-- Images built locally via `make`: playpen-base (contains omp), playpen-rust,
-  playpen-jvm. No registry, no installer.
-- The launcher is the spec: the Rust port reproduces its behavior exactly.
+## Current implementation
 
-## Target architecture
+- One Cargo package at the repository root: `Cargo.toml`, `Cargo.lock`, `src/`,
+  and `tests/`. Container recipes and JVM helper files live under `images/`;
+  installer and real-engine smoke automation live under `scripts/`.
+- A Rust launcher shells out to Podman or Docker. Podman is preferred unless
+  `PLAYPEN_ENGINE` selects Docker, or only Docker is available.
+- The invocation directory is mounted at `/workspace`. The agent runs with the
+  host user's numeric UID/GID and a persistent, expendable agent home.
+- `--shell`, explicit `-- CMD`, API keys from `keys.conf`, `op://` resolution,
+  signal cleanup, and opt-in host-engine socket access are implemented.
+- Project/global TOML supports `host_engine` only. Harness selection is still
+  stored separately in the global `harness.conf`; only omp is implemented.
+- `make` builds base and flavor images locally. The launcher pulls missing
+  flavor images from GHCR and builds thin harness layers locally. Tagged or
+  foreign images run verbatim rather than receiving a harness layer.
+- CI checks Rust and workflows, then smokes packaged musl binaries against real
+  Docker and Podman on Linux amd64/arm64. Releases still publish images to GHCR
+  alongside binary archives, checksums, and the installer.
 
-```
-fedora-minimal
-└── playpen-base:latest          (no harness)
-    ├── playpen-rust:latest  ->  playpen-rust:<harness>    (thin layers)
-    └── playpen-jvm:latest   ->  playpen-jvm:<harness>
-```
+Interactive project setup, automatic local flavor builds, the additional
+harnesses, and binary-only releases are not implemented yet.
 
-- Two image layers: flavor (toolchain; pre-built, pulled from ghcr.io) and
-  harness (omp / vibe / opencode; one RUN layer, built locally on demand,
-  never published).
-- Naming: harness as a tag variant (`playpen-jvm:omp`), so variants group
-  under one repo name in `podman image ls`.
-- The launcher orchestrates engines by shelling out (`Command`); no client
-  libraries. Engine differences stay in one place.
+## Target workflow
 
-### CLI
+### First use in a project
 
-| Command | Behavior |
-|---|---|
-| `playpen [flags] [image]` | resolve harness -> image `:<harness>`; build if missing/stale; run harness |
-| `playpen --shell ...` | bash in the same harness image |
-| `playpen ... -- CMD` | passthrough into the container |
-| `playpen ... --harness NAME` | per-run override, same build rules |
-| `playpen harness` | menu -> `HARNESS=` in `~/.config/playpen/harness.conf` |
-| `playpen harness update [NAME]` | rebuild existing `playpen*:<name>` images, cache-busted |
-| `playpen update` (phase 3) | re-pull flavor images, rebuild harness layers |
+Running `playpen` with missing or incomplete project settings starts setup:
 
-### Build rules
+1. Choose Rust, JVM, or a custom Containerfile/Dockerfile.
+2. For a custom image, ask for the file's location on disk, check that it
+   exists, and store its location in project TOML.
+3. Choose omp, pi, opencode, or vibe.
+4. Choose whether the container needs access to the host engine (`host_engine`).
+   Explain the host-access boundary and default to disabled.
+5. Atomically save complete settings in `.playpen/playpen.toml`.
+6. Build the selected environment locally, then launch the harness in the
+   mounted project directory.
 
-- Harness image missing -> build it (FROM layers are cached; cost is the
-  harness install, ~1 min).
-- Flavor image created later than its harness image -> rebuild the layer.
-  Detect via image `Created` timestamps; keeps harness layers in sync after
-  `make base` / `make jvm` rebuilds.
-- `harness update` -> `--no-cache` rebuild: fresh harness version, toolchain
-  untouched (base layers still cached).
+Docker or Podman is required to build and run Playpen containers regardless of
+`host_engine`. That setting only grants access to the host engine from inside
+the container. Local builds can still download upstream base images, packages,
+and tools; local does not mean offline or fully reproducible.
 
-## Why Rust
+### Subsequent use
 
-The state matrix is flavor x harness x engine x local/remote. Bash carried
-the current script fine but cannot express that as testable data. Rust gives
-typed state, unit tests for parsing/naming/staleness, and a static musl
-binary with no runtime dependencies - what `curl | sh` wants.
+- Load saved project settings without setup prompts.
+- Reuse an existing image and launch directly.
+- If the required image is missing, build it automatically from saved settings
+  and then launch. Do not ask the setup questions again.
+- Refresh existing environments explicitly rather than updating on every run.
+- Keep one-off launch overrides separate from persistent project settings.
 
-Rough budget: launcher ~700 lines, install.sh ~100, CI ~150 lines YAML.
+Save validated settings before building so a failed build can be retried with
+`playpen`. Cancelling setup must not persist partial answers. Existing files
+containing only `host_engine` must retain that value while setup collects the
+missing choices. Incomplete configuration without an interactive terminal must
+produce an actionable error rather than hang.
 
-## Platform support
+## Implementation boundaries
 
-| Platform | Tier |
-|---|---|
-| Linux amd64 + arm64 | Tier 1 (v1) |
-| macOS, engine-in-VM (Docker Desktop / colima) | Tier 2 (phase 4) |
-| Windows native | Out of scope; WSL2 runs the Linux binary |
+Keep a single Cargo package. Reuse the existing engine, mount, key, and signal
+handling rather than rewriting container execution or adding an engine SDK.
+Separate configuration persistence, interactive setup, image provisioning, and
+launch orchestration within the application as those responsibilities grow.
 
-## Phase 1 - Rust port at parity
+- Embed built-in recipes and required helper files in the binary so local
+  builds work without a source checkout. Build only the selected flavor and
+  harness, sharing cached base layers where appropriate.
+- Replace registry provisioning and pull-based updates with local build/update
+  behavior. Retire `PLAYPEN_REGISTRY` and the separate `harness.conf` selection
+  path when their replacements are complete; do not keep parallel conventions.
+- Use project-scoped identities for custom images so unrelated projects cannot
+  overwrite each other's environments.
+- Resolve custom recipe paths against the project root. Prefer project-relative
+  paths when possible. Default the build context to the recipe's directory and
+  allow an explicit context for recipes that copy files from another root.
+- Define custom-image prerequisites before promising arbitrary Dockerfile
+  compatibility. The current harness installer assumes npm and an `agent` user;
+  installation dependencies, entrypoints, home, ownership, and working directory
+  need a supported contract.
+- Preserve secrets outside project TOML and keep secret resolution after image
+  provisioning. Preserve cleanup, ownership, exit-status, and isolation behavior.
 
-Reproduce `bin/playpen` exactly, as a crate in `launcher/`:
+## Delivery milestones
 
-- CLI: `--host-engine` / `--no-host-engine`, project/global `config set/rm/list`,
-  `--keys FILE`, `--shell`, image positional (default `playpen-base`),
-  `-- CMD` passthrough, `-h`.
-- Engine selection: `PLAYPEN_ENGINE` or autodetect podman -> docker.
-- keys.conf: `NAME=value`, `#`-comments, CRLF tolerated, 0600 tightening,
-  `op read` for `op://` values, temp 0600 env-file removed on exit.
-- Engine specifics: podman `--userns=keep-id` + socket
-  `/run/user/$UID/podman/podman.sock` (hint: `systemctl --user start
-  podman.socket`); docker `--user $UID:$GID` + socket
-  `~/.docker/run/docker.sock` -> `/var/run/docker.sock`;
-  `DOCKER_HOST`/`CONTAINER_HOST` when `--host-engine`.
-- Mounts: `$PWD:/workspace:Z`, agent home `~/.local/share/playpen-home`,
-  `playpen-cargo` volume for `playpen-rust*`, name `playpen-agent-<pid>`.
-- Default command omp; `--shell` -> `/bin/bash`; explicit `-- CMD` wins;
-  conflicting arguments error out.
+### 1. Direction and layout — implemented
 
-Exit criteria: stub-engine test suite green (a fake podman on PATH, asserting
-the assembled argv - the same trick used to test the bash version); parity
-checklist above complete; `bin/playpen` removed; `make install` = `cargo
-build --release` + copy to `~/.local/bin`.
+- Replace the historical Bash-port/GHCR roadmap with the project-first direction.
+- Move the Rust package to the repository root and collect image resources in
+  `images/`; move the installer source to `scripts/install.sh`.
+- Update Makefile, CI/release paths, source comments, ignores, and documentation.
+- Preserve current CLI, image names, harness selection, and registry behavior.
+  The published installer asset remains named `install.sh`, so its URL is stable.
 
-## Phase 2 - Harness selection + layering
+Acceptance: standard Cargo commands work from the repository root, existing
+checks and launcher smoke scenarios still work, and image/build/package commands
+refer to the relocated resources. No setup or registry cutover belongs here.
 
-- Remove the omp install from `base/Containerfile` (flavors rebuild once).
-- Harness registry in the launcher: name -> npm package + exec command.
-  omp: `@oh-my-pi/pi-coding-agent` / `omp`. vibe, opencode: TODO exact
-  packages. Recipes are heredoc Containerfiles built in an empty temp
-  context; a harness that ever needs build-context files moves to
-  `harness/<name>/` in the repo.
-- `playpen harness` menu -> `~/.config/playpen/harness.conf`
-  (`HARNESS=omp`; per-flavor lines like `playpen-jvm=vibe` later).
-- `--harness NAME` flag; build rules as above; `harness update`.
-- Decision: `--shell` opens the harness image - the environment the agent
-  sees.
+### 2. Configuration and setup — planned
 
-Exit criteria: pick harness -> build -> run works end to end; `harness
-update` bumps the omp version (compare `omp --version` before/after)
-without rebuilding the toolchain.
+- Add typed project image/harness settings and custom recipe/context paths.
+- Extend configuration inspection/editing and introduce the first-run wizard.
+- Reuse discovery and atomic writes; detect incomplete files, preserve existing
+  values, and define how users deliberately reconfigure a project.
+- Consolidate persistent harness selection into TOML.
 
-## Phase 3 - CI publishing + installer
+Acceptance: choices survive a second invocation; partial files enter setup;
+invalid paths, invalid choices, cancellation, and noninteractive first use have
+clear behavior without partial writes. Build failures retain completed settings.
 
-- GitHub Actions: PR/main validation includes native amd64/arm64 launcher tests
-  and real Docker/Podman smoke of packaged musl binaries. Manually publishing
-  a GitHub Release with a matching `v<version>` tag triggers versioned multi-arch
-  image publication and attaches binaries, sha256 checksums, and install.sh
-  after consumer checks. Container `latest` follows GitHub's current Latest
-  stable release selection, not semantic-version ordering.
-- Launcher: pull `ghcr.io/<owner>/<image>` when missing locally; local
-  images keep working offline (a pull only happens when the image is
-  absent).
-- `playpen update`: re-pull flavors + rebuild harness layers.
-- install.sh: detect arch, fetch the release tarball, verify checksum,
-  install to `~/.local/bin`, print a PATH hint.
+### 3. Local provisioning and harnesses — planned
 
-Exit criteria: from a clean machine with no local images and no repo
-checkout: `curl -fsSL ... | sh`, then `playpen playpen-jvm` pulls, builds
-the harness layer, and runs; `playpen update` refreshes everything.
+- Bundle recipes and helper files; build base, selected flavor/custom image,
+  and selected harness locally.
+- Implement installation and execution for omp, pi, opencode, and vibe using
+  their actual dependencies rather than assuming every harness is an npm package.
+- Reuse existing images, rebuild missing images, and provide explicit refreshes.
+- Replace registry-dependent provisioning and obsolete harness-selection paths.
 
-## Phase 4 - macOS
+Acceptance: an installed binary outside the checkout builds and launches Rust,
+JVM, and supported custom environments. All four harnesses start successfully;
+repeat runs do not rebuild, and deleting a required image triggers recovery.
 
-- Targets: `aarch64-apple-darwin` (+ `x86_64-apple-darwin` for Intel Macs).
-- Engine: docker-compatible VMs first (Docker Desktop, colima, Rancher
-  Desktop); podman machine later, only if it proves solid.
-- Platform branches: drop `--userns=keep-id`; omit `--user` (the VM's file
-  sharing maps ownership); `:Z` stays (no-op); keys.conf mode handling
-  ports as-is (POSIX modes exist on APFS); `--host-engine` gated off -
-  there is no host socket file to mount.
-- Docs: engine setup, bind-mount performance caveats, VM memory limits.
-- Signing: optional. Unsigned curl-installed binaries run without
-  Gatekeeper complaints; Developer ID + notarization only if users ask.
+### 4. CI and release cutover — planned
 
-Exit criteria: the phase-3 demo works on a real Mac with Docker Desktop;
-caveats documented. Prerequisite: access to a Mac - CI cannot exercise
-the VM engines there.
+- Keep Rust formatting, Clippy, unit/integration coverage, workflow validation,
+  Linux amd64/arm64, and real Docker/Podman coverage.
+- Change smoke setup to let Playpen provision images rather than running
+  `make all` first. Drive the wizard through a pseudo-terminal with isolated
+  HOME/configuration and no AI-provider requests.
+- Exercise first use, prompt/build-free reuse, missing-image rebuilds, and a
+  custom recipe with `COPY`. Retain mount/ownership, key cleanup, exit status,
+  and enabled/disabled host-engine checks.
+- Test the exact packaged binaries outside the checkout before publication.
+- Remove registry login/pushes, manifests, digest promotion, anonymous-pull gates,
+  and package-write permissions. Publish binaries, checksums, and installer only.
 
-## Non-goals
+Acceptance: fresh-project consumer scenarios pass on supported engines and
+architectures using the release artifacts; workflows no longer publish or depend
+on Playpen images in GHCR. Develop this alongside milestone 3 and do not release
+the local-only cutover without its packaged-binary smoke coverage.
 
-- Native Windows. Use WSL2: playpen runs inside it as a Linux tool.
-- podman-on-Windows.
-- `--host-engine` outside Linux.
-- Publishing harness images; they build on demand.
-- A GUI.
+### 5. User-facing cutover — planned
 
-## Open questions
+- Keep README examples, installer instructions, help, and configuration guidance
+  aligned with each shipped change; remove the obsolete registry instructions
+  once local provisioning replaces them.
+- Document custom-image requirements, update behavior, build network needs, and
+  migration from the old harness selection/launch workflow.
+- Retire existing GitHub packages separately from stopping new publication,
+  accounting for older releases that still pull them.
 
-- Exact npm packages / exec names for vibe and opencode in the registry.
-- macOS agent-home convention: keep `~/.local/share/playpen-home` for
-  cross-platform consistency, or `~/Library/Application Support`.
-- `--shell` target: harness image (current decision) vs raw flavor image.
+Acceptance: documented installation and daily use follow the new workflow, no
+obsolete registry/configuration path remains in the shipped application, and
+package retirement has an explicit old-release policy.
+
+## Decisions to finalize during implementation
+
+- Exact installation/version policy and executable invocation for each new
+  harness, and the supported custom-image prerequisite contract.
+- CLI names for explicit setup/build/update operations and the scope of refreshes.
+- Whether launches from a subdirectory mount the resolved project root
+  (recommended) instead of the invocation directory (current behavior).
+- Image identity and dependency tracking: prefer engine image IDs/labels over
+  comparing parsed creation timestamps; avoid normal-run refresh work.
+- Whether project TOML is shared in version control or kept local, and how
+  host-engine access from existing or modified project settings is trusted.
+
+## Platform scope and non-goals
+
+Linux amd64 and arm64 remain supported, including Linux use inside WSL2.
+macOS support is deferred beyond this refactor and needs real engine-in-VM
+validation. Native Windows, a GUI, container-engine client libraries, and
+publishing Playpen images are not part of the target direction.

@@ -13,17 +13,19 @@ engine: `make all ENGINE=docker`.
 ## Layout
 
 ```
-base/                playpen-base: Fedora, git, bash, node, bun, agent user
-flavors/rust/        playpen-rust: rustup toolchain, sccache, native build deps
-flavors/jvm/         playpen-jvm: JDK LTS, Maven, Kotlin compiler, Kotlin/Java LSPs
-launcher/            Rust launcher crate (binary: playpen)
-install.sh           curl-installer for the released musl binary
-.github/workflows    PR/main validation and release-only multi-arch publication
+Cargo.toml           Rust application package (binary: playpen)
+src/                 launcher implementation
+tests/               launcher integration tests
+images/base/         playpen-base: Fedora, git, bash, node, bun, agent user
+images/rust/         playpen-rust: rustup toolchain, sccache, native build deps
+images/jvm/          playpen-jvm: JDK LTS, Maven, Kotlin compiler, Kotlin/Java LSPs
+scripts/             release installer and real-engine smoke runner
+.github/workflows/   PR/main validation and release-only multi-arch publication
 keys.conf.example    template for ~/.config/playpen/keys.conf (API keys)
 Makefile             build helpers
 ```
 
-Adding a flavor: one directory under `flavors/` with a Containerfile
+Adding a flavor: one directory under `images/` with a Containerfile
 (`FROM playpen-base:latest`), one rule in the Makefile, tag it
 `playpen-<flavor>`. The launcher needs no changes: `playpen playpen-<flavor>`
 gives it a harness layer automatically.
@@ -203,7 +205,7 @@ The agent itself is a thin image layer the launcher builds and maintains:
   never advance it. Anonymous pulls require public packages. `PLAYPEN_REGISTRY`
   overrides the registry (a mirror, or images you pushed under another owner).
 - The base image is `fedora-minimal` (`ARG FEDORA_VERSION` in
-  `base/Containerfile`); bump it and `make base` to move to a newer release.
+  `images/base/Containerfile`); bump it and `make base` to move to a newer release.
   It carries no harness anymore - the launcher layers omp (and later
   alternatives) on top of the flavors on demand.
 - Rust: `CARGO_HOME=/opt/agent-cargo`, mounted as the named volume
@@ -218,7 +220,7 @@ The agent itself is a thin image layer the launcher builds and maintains:
   Both downloads are pinned and SHA-256 checked, with Linux amd64/arm64
   selection. Kotlin LSP is alpha and includes its own JetBrains Runtime;
   JDT LS uses the image's JDK, which must remain compatible if changing
-  `JDK_VERSION` in `flavors/jvm/Containerfile`. Updating Kotlin LSP requires
+  `JDK_VERSION` in `images/jvm/Containerfile`. Updating Kotlin LSP requires
   updating both architecture checksums; updating JDT LS requires its version,
   build timestamp, and checksum.
   The launchers set JVM `user.home` from `$HOME` for numeric host UIDs.
@@ -292,18 +294,26 @@ It uses a pseudo-terminal because the launcher is interactive. Its temporary
 configuration, image aliases, sibling containers, and cargo volume are removed
 afterward; it does not use your API keys or call an AI provider.
 
-Run the same checks locally with a real engine:
+Run Rust checks from the repository root:
+
+```bash
+cargo fmt --all -- --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+Run the smoke checks locally with a real engine:
 
 ```bash
 make test
 make all ENGINE=podman
-cargo build --release --locked --manifest-path launcher/Cargo.toml
+cargo build --release --locked
 systemctl --user start podman.socket
-python3 scripts/smoke.py --engine podman --launcher launcher/target/release/playpen
+python3 scripts/smoke.py --engine podman --launcher target/release/playpen
 # For Docker, build images with ENGINE=docker and use --engine docker.
 ```
 
-To release, update `launcher/Cargo.toml` and `launcher/Cargo.lock` and commit
+To release, update `Cargo.toml` and `Cargo.lock` and commit
 the version change. In **GitHub → Releases → Draft a new release**, choose or
 create a `v<version>` tag matching the launcher package version, for example
 `v0.1.0` or `v0.2.0-rc.1`. Write the title and notes, choose the prerelease and
@@ -318,7 +328,7 @@ The workflow:
    from their digests (including provenance), and checks both Linux architectures.
 4. Pulls each versioned image without registry credentials on both architectures
    with Docker and Podman, then runs the packaged-launcher smoke again.
-5. Attaches the binary archives, checksums, and `install.sh` to your existing
+5. Attaches the binary archives, checksums, and `scripts/install.sh` (as `install.sh`) to your existing
    release. It then advances container `:latest` only if the release is not a
    prerelease and GitHub still designates it as Latest, verifying the public aliases.
 
@@ -360,5 +370,6 @@ changing credentials; a failed workflow leaves the manually published release in
 
 ## Roadmap
 
-The plan - Rust launcher, harness layering, published images, installer,
-macOS support - lives in [ROADMAP.md](ROADMAP.md).
+The move to project-local interactive setup, local image builds, and binary-only
+releases is planned in [ROADMAP.md](ROADMAP.md). The commands above describe the
+current behavior; setup and registry removal are not implemented yet.

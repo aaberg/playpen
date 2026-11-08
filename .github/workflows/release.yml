@@ -53,7 +53,7 @@ jobs:
       - name: Check release tag matches launcher version
         id: version
         run: |
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("launcher/Cargo.toml", "rb"))["package"]["version"])')
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           if test "$TAG" != "v$version"; then
             echo "Release tag $TAG must match launcher version v$version" >&2
             exit 1
@@ -68,9 +68,9 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          cargo build --release --locked --manifest-path launcher/Cargo.toml --target "${{ matrix.target }}"
+          cargo build --release --locked --target "${{ matrix.target }}"
           asset="playpen-${{ matrix.suffix }}.tar.gz"
-          tar -czf "$asset" -C "launcher/target/${{ matrix.target }}/release" playpen
+          tar -czf "$asset" -C "target/${{ matrix.target }}/release" playpen
           mkdir -p "$RUNNER_TEMP/package"
           tar -xzf "$asset" -C "$RUNNER_TEMP/package"
           test "$("$RUNNER_TEMP/package/playpen" --version)" = "playpen $VERSION"
@@ -239,7 +239,7 @@ jobs:
           sha256sum playpen-*.tar.gz > SHA256SUMS
           sha256sum -c SHA256SUMS
           # Reruns replace generated assets without editing the release itself.
-          gh release upload "$TAG" playpen-*.tar.gz SHA256SUMS install.sh --clobber
+          gh release upload "$TAG" playpen-*.tar.gz SHA256SUMS scripts/install.sh --clobber
       - name: Check GitHub's current Latest release
         id: latest
         if: ${{ !github.event.release.prerelease }}

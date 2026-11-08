@@ -17,7 +17,7 @@ fail() {
 os=$(uname -s)
 case "$os" in
   Linux) ;;
-  Darwin) fail "macOS support is phase 4 (roadmap) - run inside WSL2/Linux or build from source" ;;
+  Darwin) fail "macOS support is not implemented - run inside WSL2/Linux or build from source" ;;
   *) fail "unsupported OS: $os" ;;
 esac
 
