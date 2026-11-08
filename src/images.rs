@@ -1,10 +1,9 @@
-//! Harness-layer orchestration: how the image positional maps to the image
-//! that runs, the build rules from the roadmap (build when missing, rebuild
-//! when the flavor image is newer), pulling flavor images from the registry
-//! when they are missing locally (phase 3), and `harness update` /
-//! `playpen update`. All engine interaction goes through `Command` - no
-//! client libraries - and engine differences stay limited to flags both
-//! understand.
+//! Harness-layer orchestration: mapping the image positional to the image
+//! that runs, building missing layers, and rebuilding layers when their
+//! flavor is newer. Missing flavors are currently pulled from the registry;
+//! `harness update` and `playpen update` refresh installed images.
+//! All engine interaction goes through `Command`, with flags understood by
+//! both Podman and Docker.
 
 use std::ffi::OsString;
 use std::process::Command;
@@ -48,9 +47,9 @@ enum CreatedError {
     Failed(String),
 }
 
-/// Where flavor images are pulled from when missing locally (roadmap
-/// phase 3). The local image keeps its plain name (`playpen-jvm`), so
-/// layer names, staleness and updates are unaffected by the registry.
+/// Where flavor images are currently pulled from when missing locally.
+/// The local image keeps its plain name (`playpen-jvm`), so layer names,
+/// staleness and updates are unaffected by the registry.
 pub const DEFAULT_REGISTRY: &str = "ghcr.io/aaberg";
 
 /// The registry to pull flavors from: `PLAYPEN_REGISTRY` when set, else

@@ -1,15 +1,13 @@
 //! Integration tests: run the playpen binary against stub engines on PATH and
-//! assert the assembled argv - the exit-criteria technique from the roadmap,
-//! the same way the bash launcher was tested.
+//! assert image provisioning, configuration, and launch behavior.
 //!
 //! Every test runs in an isolated fixture (HOME, XDG dirs, workspace) with a
 //! scrubbed environment, so results do not depend on the host's podman,
-//! docker, op or ~/.config. The stub engine also fakes the image commands
-//! phases 2-3 added: `image inspect --format {{.Created}}` and `images` read
-//! a state file of `ref<TAB>created` lines, `build` records its argv plus
-//! the Containerfile it was handed, and `pull`/`tag` (phase 3) record their
-//! argv and read a separate registry state file - seeding a ref there makes
-//! `pull` fetch it, an empty registry fails like an unreachable one.
+//! docker, op or ~/.config. The stub engine also fakes image commands:
+//! `image inspect --format {{.Created}}` and `images` read a state file of
+//! `ref<TAB>created` lines, and `build` records its argv and Containerfile.
+//! `pull` and `tag` record their argv and read a separate registry state file:
+//! seeding a ref there makes `pull` fetch it; an empty registry fails.
 
 use std::fs;
 use std::io::Write;

@@ -42,11 +42,11 @@ jobs:
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Check formatting
-        run: cargo +stable fmt --manifest-path launcher/Cargo.toml --all -- --check
+        run: cargo +stable fmt --all -- --check
       - name: Run unit and launcher integration tests
-        run: cargo +stable test --locked --manifest-path launcher/Cargo.toml
+        run: cargo +stable test --locked
       - name: Check Clippy
-        run: cargo +stable clippy --locked --manifest-path launcher/Cargo.toml --all-targets -- -D warnings
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
 
   containers:
     name: packaged launcher (${{ matrix.platform.suffix }}, ${{ matrix.engine }})
@@ -100,9 +100,9 @@ jobs:
         run: make all ENGINE="$ENGINE"
       - name: Build and package static launcher
         run: |
-          cargo +stable build --release --locked --manifest-path launcher/Cargo.toml --target "$TARGET"
+          cargo +stable build --release --locked --target "$TARGET"
           tar -czf "$RUNNER_TEMP/playpen-$SUFFIX.tar.gz" \
-            -C "launcher/target/$TARGET/release" playpen
+            -C "target/$TARGET/release" playpen
       - name: Extract packaged launcher and check manifest version
         run: |
           mkdir -p "$RUNNER_TEMP/playpen-package"
@@ -113,7 +113,7 @@ jobs:
           import subprocess
           import tomllib
 
-          with open("launcher/Cargo.toml", "rb") as manifest:
+          with open("Cargo.toml", "rb") as manifest:
               version = tomllib.load(manifest)["package"]["version"]
           launcher = pathlib.Path(os.environ["RUNNER_TEMP"]) / "playpen-package" / "playpen"
           actual = subprocess.check_output([str(launcher), "--version"], text=True).strip()

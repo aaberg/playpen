@@ -1,5 +1,5 @@
 # playpen-rust — Rust development on top of playpen-base
-# Build: make rust   (or: podman build -t playpen-rust flavors/rust)
+# Build: make rust   (or: podman build -t playpen-rust images/rust)
 FROM playpen-base:latest
 
 USER root

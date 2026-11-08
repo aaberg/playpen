@@ -1,8 +1,6 @@
-//! CLI parsing. The run flags are the phase-1 spec, ported from
-//! `bin/playpen`; messages marked "spec" keep the bash launcher's exact
-//! wording. Phase 2 adds the `--harness` flag and the `harness` subcommand,
-//! phase 3 the `update` subcommand. Everything downstream receives a fully
-//! resolved [`Action`].
+//! CLI parsing for container launches, harness selection and updates, and
+//! configuration commands. Everything downstream receives a fully resolved
+//! [`Action`].
 
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;

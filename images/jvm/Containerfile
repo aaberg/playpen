@@ -1,5 +1,5 @@
 # playpen-jvm — JVM/Kotlin development on top of playpen-base
-# Build: make jvm   (or: podman build -t playpen-jvm flavors/jvm)
+# Build: make jvm   (or: podman build -t playpen-jvm images/jvm)
 FROM playpen-base:latest
 
 USER root
