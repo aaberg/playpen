@@ -154,7 +154,7 @@ fn fetch(engine: Engine, flavor: &str, registry: &str) -> Result<(), String> {
 /// `harness update` with fresh toolchains underneath. A failed pull
 /// aborts the update (the engine's error has already streamed).
 pub fn refresh(host: &Host, engine: Engine, name: Option<&str>) -> ! {
-    let harness = harness::resolve(host, name);
+    let harness = selected_harness(host, name);
     let registry = registry(host);
     let matching: Vec<String> = list(engine)
         .into_iter()
@@ -178,7 +178,7 @@ pub fn refresh(host: &Host, engine: Engine, name: Option<&str>) -> ! {
 /// `harness update [NAME]`: rebuild every existing `playpen*:<name>` image
 /// cache-busted - a fresh harness version on an untouched toolchain.
 pub fn update(host: &Host, engine: Engine, name: Option<&str>) -> ! {
-    let harness = harness::resolve(host, name);
+    let harness = selected_harness(host, name);
     let matching: Vec<String> = list(engine)
         .into_iter()
         .filter(|image_ref| matches_playpen_harness(image_ref, harness.name))
@@ -193,6 +193,12 @@ pub fn update(host: &Host, engine: Engine, name: Option<&str>) -> ! {
         build(engine, repo, &image_ref, harness, true);
     }
     std::process::exit(0)
+}
+
+fn selected_harness(host: &Host, name: Option<&str>) -> &'static Harness {
+    let selection = crate::config::selection(host)
+        .unwrap_or_else(|err| signals::fail(format!("playpen: {err}")));
+    harness::resolve(name.or(selection.harness.as_ref().map(|choice| choice.as_str())))
 }
 
 /// `playpen*:<name>` per the roadmap. podman lists local images under

@@ -9,6 +9,43 @@ use toml_edit::{DocumentMut, Value};
 
 use crate::host::Host;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Image {
+    Rust,
+    Jvm,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HarnessChoice {
+    Omp,
+    Pi,
+    Opencode,
+    Vibe,
+}
+
+macro_rules! choices {
+    ($ty:ident, $label:literal, $($variant:ident => $name:literal),+ $(,)?) => {
+        impl $ty {
+            pub fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $name),+ }
+            }
+        }
+        impl std::str::FromStr for $ty {
+            type Err = String;
+            fn from_str(value: &str) -> Result<Self, String> {
+                match value {
+                    $($name => Ok(Self::$variant),)+
+                    _ => Err(format!("invalid {} {value:?}: expected {}", $label,
+                        [$($name),+].join(", "))),
+                }
+            }
+        }
+    };
+}
+choices!(Image, "image", Rust => "rust", Jvm => "jvm", Custom => "custom");
+choices!(HarnessChoice, "harness", Omp => "omp", Pi => "pi", Opencode => "opencode", Vibe => "vibe");
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Resolved {
     pub host_engine: bool,
@@ -16,205 +53,374 @@ pub struct Resolved {
     pub source: Option<PathBuf>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub image: Option<Image>,
+    pub harness: Option<HarnessChoice>,
+    pub containerfile: Option<PathBuf>,
+    pub context: Option<PathBuf>,
+}
+
 pub fn resolve(host: &Host, host_engine_override: Option<bool>) -> Result<Resolved, String> {
+    Ok(Files::load(host)?.resolve(host_engine_override))
+}
+
+pub fn selection(host: &Host) -> Result<Selection, String> {
     let files = Files::load(host)?;
-    Ok(files.resolve(host_engine_override))
+    Ok(Selection {
+        image: files
+            .effective_string("image")
+            .map(str::parse)
+            .transpose()?,
+        harness: files
+            .effective_string("harness")
+            .map(str::parse)
+            .transpose()?,
+        containerfile: files.project.resolved_path("containerfile"),
+        context: files.project.resolved_path("context"),
+    })
 }
 
-/// List effective persistent settings as TOML, with their winning sources.
-/// Global-only listing never discovers or loads project configuration.
-pub fn list(host: &Host, global: bool) -> Result<String, String> {
-    let resolved = if global {
-        let file = File::load(global_path(host))?;
-        resolve_files(&[&file])
-    } else {
-        resolve(host, None)?
-    };
-    let source = match resolved.source {
-        // Debug formatting escapes control characters in paths so the source
-        // remains a single TOML comment, even for unusual directory names.
-        Some(path) => format!("{path:?}"),
-        None => "built-in default".to_owned(),
-    };
-    Ok(format!(
-        "# source: {source}\nhost_engine = {}\n",
-        resolved.host_engine
-    ))
-}
-
-/// Set (`Some`) or remove (`None`) a known setting in the selected scope.
-/// Load both effective layers before writing so invalid configuration cannot
-/// cause an otherwise successful edit to fail only when reporting its result.
-pub fn edit(host: &Host, global: bool, key: &str, value: Option<&str>) -> Result<String, String> {
-    if key != "host_engine" {
-        return Err(format!("unknown configuration key {key:?}"));
+pub fn project_ready(host: &Host) -> Result<bool, String> {
+    let files = Files::load(host)?;
+    if !files.project.complete() {
+        return Ok(false);
     }
-    let enabled = match value {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        Some(value) => {
-            return Err(format!(
-                "invalid value {value:?} for host_engine: expected true or false"
-            ));
+    if files.project.string("image") == Some("custom")
+        && (files.project.string("containerfile").is_none()
+            || files.project.string("context").is_none())
+    {
+        return Ok(false);
+    }
+    files.project.validate_paths(true)?;
+    Ok(true)
+}
+
+/// Global inspection never discovers or reads project configuration.
+pub fn list(host: &Host, global: bool) -> Result<String, String> {
+    if global {
+        let file = File::load(global_path(host), true)?;
+        Ok(describe(&[&file]))
+    } else {
+        let files = Files::load(host)?;
+        Ok(describe(&[&files.project, &files.global]))
+    }
+}
+
+fn describe(files: &[&File]) -> String {
+    let mut output = String::new();
+    for key in [
+        "image",
+        "harness",
+        "host_engine",
+        "containerfile",
+        "context",
+    ] {
+        if let Some(file) = files.iter().find(|file| file.document.contains_key(key)) {
+            let value = file.document[key]
+                .as_value()
+                .expect("validated scalar")
+                .clone();
+            let value = match value {
+                Value::Boolean(value) => value.value().to_string(),
+                Value::String(value) => toml_edit::value(value.value().as_str()).to_string(),
+                _ => unreachable!("validated scalar"),
+            };
+            output.push_str(&format!("# source: {:?}\n{key} = {value}\n", file.path));
+        } else if key == "host_engine" {
+            output.push_str("# source: built-in default\nhost_engine = false\n");
         }
-        None => None,
-    };
+    }
+    output
+}
+
+pub fn edit(host: &Host, global: bool, key: &str, value: Option<&str>) -> Result<String, String> {
+    validate_key(key, global)?;
+    let replacement = value.map(|value| parse_value(key, value)).transpose()?;
     let mut files = Files::load(host)?;
     let file = if global {
         &mut files.global
     } else {
         &mut files.project
     };
-    let changed = match enabled {
-        Some(enabled) if file.host_engine() == Some(enabled) => false,
-        Some(enabled) => {
-            if let Some(old) = file
-                .document
-                .get_mut(key)
-                .and_then(|item| item.as_value_mut())
-            {
-                let mut replacement = Value::from(enabled);
-                *replacement.decor_mut() = old.decor().clone();
-                *old = replacement;
-            } else {
-                file.document[key] = toml_edit::value(enabled);
-            }
-            true
-        }
-        None => file.remove_host_engine(),
-    };
-    let path = file.path.clone();
-    let effective = files.resolve(None);
-    if changed {
-        let file = if global {
-            &files.global
-        } else {
-            &files.project
-        };
-        atomic_write(&path, &file.document.to_string())?;
+    let before = file.document.to_string();
+    file.change(key, replacement);
+    file.validate(global)?;
+    if !global && value.is_some() && matches!(key, "containerfile" | "context") {
+        file.validate_path(key, key == "context")?;
     }
-    let action = if changed { "Updated" } else { "Unchanged" };
-    let source = match &effective.source {
-        Some(source) => source.display().to_string(),
-        None => "built-in default".to_owned(),
-    };
+    let changed = before != file.document.to_string();
+    if changed {
+        file.save()?;
+    }
+    let path = file.path.clone();
     Ok(format!(
-        "{action} {}\nhost_engine = {} (source: {source})",
+        "{} {}\n{}",
+        if changed { "Updated" } else { "Unchanged" },
         path.display(),
-        effective.host_engine
+        describe(&[&files.project, &files.global])
     ))
 }
 
-struct Files {
-    global: File,
-    project: File,
+fn validate_key(key: &str, global: bool) -> Result<(), String> {
+    match key {
+        "image" | "harness" | "host_engine" => Ok(()),
+        "containerfile" | "context" if !global => Ok(()),
+        "containerfile" | "context" => Err(format!("{key} is project-only; omit --global")),
+        _ => Err(format!("unknown configuration key {key:?}")),
+    }
+}
+
+fn parse_value(key: &str, value: &str) -> Result<Value, String> {
+    match key {
+        "host_engine" => match value {
+            "true" => Ok(Value::from(true)),
+            "false" => Ok(Value::from(false)),
+            _ => Err(format!(
+                "invalid value {value:?} for host_engine: expected true or false"
+            )),
+        },
+        "image" => Ok(Value::from(value.parse::<Image>()?.as_str())),
+        "harness" => Ok(Value::from(value.parse::<HarnessChoice>()?.as_str())),
+        "containerfile" | "context" if !value.is_empty() => Ok(Value::from(value)),
+        _ => Err(format!("{key} must be a nonempty path")),
+    }
+}
+
+pub(crate) struct Files {
+    pub(crate) global: File,
+    pub(crate) project: File,
 }
 
 impl Files {
-    fn load(host: &Host) -> Result<Self, String> {
+    pub(crate) fn load(host: &Host) -> Result<Self, String> {
         let project_path = project_path(host)?;
-        // Both files are validated even when a flag or project setting wins.
-        let global = File::load(global_path(host))?;
-        let project = File::load(project_path)?;
-        Ok(Self { global, project })
+        Ok(Self {
+            global: File::load(global_path(host), true)?,
+            project: File::load(project_path, false)?,
+        })
     }
 
-    fn resolve(&self, host_engine_override: Option<bool>) -> Resolved {
+    pub(crate) fn effective_string(&self, key: &str) -> Option<&str> {
+        self.project.string(key).or_else(|| self.global.string(key))
+    }
+
+    pub(crate) fn resolve(&self, host_engine_override: Option<bool>) -> Resolved {
         if let Some(host_engine) = host_engine_override {
             return Resolved {
                 host_engine,
                 source: None,
             };
         }
-        resolve_files(&[&self.project, &self.global])
-    }
-}
-
-fn resolve_files(files: &[&File]) -> Resolved {
-    for file in files {
-        if let Some(host_engine) = file.host_engine() {
-            return Resolved {
-                host_engine,
-                source: Some(file.path.clone()),
-            };
+        for file in [&self.project, &self.global] {
+            if let Some(host_engine) = file.host_engine() {
+                return Resolved {
+                    host_engine,
+                    source: Some(file.path.clone()),
+                };
+            }
+        }
+        Resolved {
+            host_engine: false,
+            source: None,
         }
     }
-    Resolved {
-        host_engine: false,
-        source: None,
-    }
 }
 
-struct File {
-    path: PathBuf,
+pub(crate) struct File {
+    pub(crate) path: PathBuf,
     document: DocumentMut,
 }
 
 impl File {
-    fn load(path: PathBuf) -> Result<Self, String> {
+    fn load(path: PathBuf, global: bool) -> Result<Self, String> {
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(err)
                 if err.kind() == io::ErrorKind::NotFound && !configuration_entry_exists(&path)? =>
             {
-                return Ok(Self {
-                    path,
-                    document: DocumentMut::new(),
-                });
+                String::new()
             }
             Err(err) => return Err(path_error("read configuration", &path, err)),
         };
         let document = text
             .parse::<DocumentMut>()
             .map_err(|err| format!("invalid configuration {}: {err}", path.display()))?;
-        for (key, item) in document.iter() {
-            if key != "host_engine" {
-                return Err(format!(
-                    "invalid configuration {}: unknown key {key:?}",
-                    path.display()
-                ));
-            }
-            if item.as_bool().is_none() {
-                return Err(format!(
-                    "invalid configuration {}: host_engine must be a boolean",
-                    path.display()
-                ));
-            }
-        }
-        Ok(Self { path, document })
+        let file = Self { path, document };
+        file.validate(global)?;
+        Ok(file)
     }
 
-    fn host_engine(&self) -> Option<bool> {
+    fn validate(&self, global: bool) -> Result<(), String> {
+        for (key, item) in self.document.iter() {
+            let result = validate_key(key, global).and_then(|()| {
+                if key == "host_engine" {
+                    item.as_bool()
+                        .map(|_| ())
+                        .ok_or_else(|| "host_engine must be a boolean".to_owned())
+                } else {
+                    let value = item
+                        .as_str()
+                        .ok_or_else(|| format!("{key} must be a string"))?;
+                    parse_value(key, value).map(|_| ())
+                }
+            });
+            result
+                .map_err(|err| format!("invalid configuration {}: {err}", self.path.display()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn string(&self, key: &str) -> Option<&str> {
+        self.document.get(key).and_then(|item| item.as_str())
+    }
+
+    pub(crate) fn host_engine(&self) -> Option<bool> {
         self.document
             .get("host_engine")
             .and_then(|item| item.as_bool())
     }
 
-    fn remove_host_engine(&mut self) -> bool {
-        let Some((key, item)) = self.document.remove_entry("host_engine") else {
-            return false;
+    pub(crate) fn complete(&self) -> bool {
+        self.string("image").is_some()
+            && self.string("harness").is_some()
+            && self.host_engine().is_some()
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        self.path
+            .parent()
+            .expect("config directory")
+            .parent()
+            .expect("project root")
+    }
+
+    pub(crate) fn resolved_path(&self, key: &str) -> Option<PathBuf> {
+        self.string(key).map(|value| self.root().join(value))
+    }
+
+    pub(crate) fn validate_paths(&self, require_custom: bool) -> Result<(), String> {
+        for (key, directory) in [("containerfile", false), ("context", true)] {
+            if self.string(key).is_some() {
+                self.validate_path(key, directory)?;
+            } else if require_custom && self.string("image") == Some("custom") {
+                return Err(format!("custom image requires {key}; run playpen setup"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_path(&self, key: &str, directory: bool) -> Result<(), String> {
+        let Some(path) = self.resolved_path(key) else {
+            return Ok(());
         };
-        // This is the only accepted setting, so removing it leaves an empty
-        // table. Keep its leading comments and turn an inline comment into a
-        // standalone comment before the document's existing footer.
-        let prefix = key
+        let metadata = fs::metadata(&path).map_err(|err| {
+            format!(
+                "{}; correct {key} with playpen config or run playpen setup",
+                path_error("inspect custom image path", &path, err)
+            )
+        })?;
+        if if directory {
+            !metadata.is_dir()
+        } else {
+            !metadata.is_file()
+        } {
+            return Err(format!(
+                "{key} {} must be a {}; run playpen setup",
+                path.display(),
+                if directory { "directory" } else { "file" }
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        self.change(key, Some(parse_value(key, value)?));
+        Ok(())
+    }
+
+    fn change(&mut self, key: &str, replacement: Option<Value>) {
+        if let Some(mut replacement) = replacement {
+            let unchanged = self
+                .document
+                .get(key)
+                .and_then(|item| item.as_value())
+                .map(|old| match (&replacement, old) {
+                    (Value::Boolean(new), Value::Boolean(old)) => new.value() == old.value(),
+                    (Value::String(new), Value::String(old)) => new.value() == old.value(),
+                    _ => false,
+                })
+                .unwrap_or(false);
+            if unchanged
+                && !(key == "image"
+                    && self.string("image") != Some("custom")
+                    && (self.document.contains_key("containerfile")
+                        || self.document.contains_key("context")))
+            {
+                return;
+            }
+            if let Some(old) = self
+                .document
+                .get_mut(key)
+                .and_then(|item| item.as_value_mut())
+            {
+                *replacement.decor_mut() = old.decor().clone();
+                *old = replacement;
+            } else {
+                self.document[key] = toml_edit::Item::Value(replacement);
+            }
+            if key == "image" && self.string("image") != Some("custom") {
+                self.remove("containerfile");
+                self.remove("context");
+            }
+        } else {
+            self.remove(key);
+        }
+    }
+
+    fn remove(&mut self, name: &str) {
+        let next = self
+            .document
+            .iter()
+            .skip_while(|(key, _)| *key != name)
+            .nth(1)
+            .map(|(key, _)| key.to_owned());
+        let Some((key, item)) = self.document.remove_entry(name) else {
+            return;
+        };
+        let mut comments = key
             .leaf_decor()
             .prefix()
             .and_then(|raw| raw.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_owned();
         let suffix = item
             .as_value()
             .and_then(|value| value.decor().suffix())
             .and_then(|raw| raw.as_str())
             .unwrap_or("");
-        let mut comments = prefix.to_owned();
         if suffix.contains('#') {
             comments.push_str(suffix);
             comments.push('\n');
         }
-        comments.push_str(self.document.trailing().as_str().unwrap_or(""));
-        self.document.set_trailing(comments);
-        true
+        if let Some(next) = next {
+            let mut key = self.document.key_mut(&next).expect("following key");
+            comments.push_str(
+                key.leaf_decor()
+                    .prefix()
+                    .and_then(|raw| raw.as_str())
+                    .unwrap_or(""),
+            );
+            key.leaf_decor_mut().set_prefix(comments);
+        } else {
+            comments.push_str(self.document.trailing().as_str().unwrap_or(""));
+            self.document.set_trailing(comments);
+        }
+    }
+
+    pub(crate) fn save(&self) -> Result<(), String> {
+        self.validate(false)?;
+        atomic_write(&self.path, &self.document.to_string())
     }
 }
 
@@ -730,5 +936,102 @@ mod tests {
             resolve(&f.host, None).unwrap().source,
             Some(xdg.join("playpen/playpen.toml"))
         );
+    }
+
+    #[test]
+    fn typed_values_and_project_only_paths_are_validated_without_writes() {
+        let f = Fixture::new();
+        for (key, value) in [
+            ("image", "Rust"),
+            ("harness", "unknown"),
+            ("context", ""),
+            ("containerfile", "missing"),
+        ] {
+            assert!(edit(&f.host, false, key, Some(value)).is_err());
+        }
+        for key in ["containerfile", "context"] {
+            assert!(edit(&f.host, true, key, Some(".")).is_err());
+        }
+        assert!(!f.project().exists());
+        for harness in ["omp", "pi", "opencode", "vibe"] {
+            edit(&f.host, false, "harness", Some(harness)).unwrap();
+            assert_eq!(
+                selection(&f.host).unwrap().harness.unwrap().as_str(),
+                harness
+            );
+        }
+        f.put(&f.global(), "containerfile = 'Containerfile'\n");
+        assert!(list(&f.host, true).is_err());
+    }
+
+    #[test]
+    fn partial_custom_configuration_is_not_ready_and_paths_use_discovered_root() {
+        let mut f = Fixture::new();
+        let root = f.host.workspace.clone();
+        f.put(&root.join("recipes/Containerfile"), "FROM scratch\n");
+        f.put(
+            &f.project(),
+            "image = 'custom'\nharness = 'omp'\nhost_engine = false\n",
+        );
+        f.host.workspace = root.join("nested/deep");
+        fs::create_dir_all(&f.host.workspace).unwrap();
+        assert!(!project_ready(&f.host).unwrap());
+        edit(
+            &f.host,
+            false,
+            "containerfile",
+            Some("recipes/Containerfile"),
+        )
+        .unwrap();
+        edit(&f.host, false, "context", Some("recipes")).unwrap();
+        assert!(project_ready(&f.host).unwrap());
+        let selected = selection(&f.host).unwrap();
+        assert_eq!(
+            selected.containerfile,
+            Some(root.join("recipes/Containerfile"))
+        );
+        assert_eq!(selected.context, Some(root.join("recipes")));
+        fs::remove_file(root.join("recipes/Containerfile")).unwrap();
+        assert!(project_ready(&f.host).is_err());
+        // Stale paths do not prevent replacing the other path or switching away.
+        edit(&f.host, false, "context", Some(".")).unwrap();
+        edit(&f.host, false, "image", Some("rust")).unwrap();
+        assert!(project_ready(&f.host).unwrap());
+    }
+
+    #[test]
+    fn builtin_switch_removes_multiple_keys_but_preserves_each_comment() {
+        let f = Fixture::new();
+        f.put(&f.project(), "# image note\nimage = 'custom'\n# recipe note\ncontainerfile = 'stale' # recipe inline\n# context note\ncontext = 'stale' # context inline\n# harness note\nharness = 'omp'\nhost_engine = false\n# footer\n");
+        edit(&f.host, false, "image", Some("jvm")).unwrap();
+        let saved = fs::read_to_string(f.project()).unwrap();
+        for comment in [
+            "# image note",
+            "# recipe note",
+            "# recipe inline",
+            "# context note",
+            "# context inline",
+            "# harness note",
+            "# footer",
+        ] {
+            assert_eq!(saved.matches(comment).count(), 1, "{saved}");
+        }
+        assert!(!saved.contains("containerfile ="));
+        assert!(!saved.contains("context ="));
+        assert!(project_ready(&f.host).unwrap());
+    }
+
+    #[test]
+    fn global_inspection_does_not_read_invalid_project() {
+        let f = Fixture::new();
+        f.put(&f.project(), "invalid = [");
+        f.put(
+            &f.global(),
+            "image = 'jvm'\nharness = 'pi'\nhost_engine = true\n",
+        );
+        let listing = list(&f.host, true).unwrap();
+        assert!(listing.contains("image = \"jvm\""));
+        assert!(listing.contains("harness = \"pi\""));
+        assert!(listing.contains("host_engine = true"));
     }
 }

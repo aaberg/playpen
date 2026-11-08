@@ -209,7 +209,7 @@ class Smoke:
         self.keys = playpen_config / "keys.conf"
         self.keys.write_text(KEYS)
         self.keys.chmod(0o644)  # The launcher must tighten this to 0600.
-        (playpen_config / "harness.conf").write_text("HARNESS=omp\n")
+        (playpen_config / "playpen.toml").write_text('harness = "omp"\n')
         settings = root / "engine-settings.json"
         settings.write_text(json.dumps({
             "engine": self.engine,
