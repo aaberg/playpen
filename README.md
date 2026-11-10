@@ -66,13 +66,14 @@ chmod 600 ~/.config/playpen/keys.conf
 
 ```bash
 cd ~/Development/myproject
-playpen playpen-rust    # Rust project (runs playpen-rust:omp)
-playpen playpen-jvm     # JVM/Kotlin project
-playpen                 # no flavor: plain base
-playpen --host-engine playpen-rust   # trusted project: + host engine socket
-playpen --no-host-engine playpen-rust # disable configured host engine access
-playpen --shell playpen-rust         # bash prompt in the harness image
-playpen playpen-jvm -- omp --version # any other command inside
+playpen                 # first run: setup, then launch; later runs: reuse settings
+playpen setup           # reconfigure this project without building or launching
+playpen playpen-rust    # one-off image; bypass setup without changing settings
+playpen playpen-jvm     # one-off JVM/Kotlin image
+playpen --host-engine   # trusted project: grant host engine socket access
+playpen --no-host-engine # disable configured host engine access for this run
+playpen --shell         # bash prompt in the configured harness image
+playpen -- omp --version # any other command inside the configured image
 playpen update          # re-pull flavors from ghcr.io + rebuild layers
 ```
 
@@ -94,15 +95,58 @@ live in `$XDG_CONFIG_HOME/playpen/playpen.toml`, falling back to
 or relative. The same fallback applies on Linux, WSL, and macOS; it does not
 depend on the variable being set by the operating system.
 
-The first supported setting is a TOML boolean:
+Running without an explicit image completes missing project settings
+interactively: choose Rust/JVM/custom, a harness, and host-engine access.
+`playpen setup` asks every question again, using current values as defaults,
+and stops after saving. Setup and configuration commands do not require an
+engine. Docker or Podman is always required to build/run containers;
+`host_engine` only grants the container access to that host engine, with the
+permissions of your host user.
 
 ```toml
-host_engine = true
+image = "rust"
+harness = "omp"
+host_engine = false
 ```
+
+Setup asks only for missing local choices on an ordinary launch, preserving
+existing answers (including `host_engine = false`). Global settings seed
+defaults, but setup saves complete choices locally. Answers are validated and
+saved atomically before provisioning. Invalid input is explained and prompted
+again; `q`, EOF, or Ctrl-C cancels without saving partial answers. Incomplete
+configuration without an interactive terminal fails with instructions instead
+of waiting for input. A provisioning failure retains the completed settings.
+
+The schema accepts `image = "rust"`, `"jvm"`, or `"custom"` and
+`harness = "omp"`, `"pi"`, `"opencode"`, or `"vibe"`. **This milestone can
+launch built-in Rust/JVM with omp only.** Custom image provisioning and the
+additional harness installers arrive in milestone 3; selecting one saves the
+configuration, then launch reports the unsupported provisioning explicitly.
+Built-in flavors still use the existing local-image/GHCR provisioning path.
+
+Custom settings also include:
+
+```toml
+image = "custom"
+containerfile = "containers/Containerfile"
+context = "containers"
+harness = "omp"
+host_engine = false
+```
+
+The recipe must be a file and the context a directory. Relative paths resolve
+from the discovered project root, not the invocation directory or `.playpen/`.
+Setup defaults the context to the recipe's directory and allows another root.
+`containerfile` and `context` are project-only settings.
 
 Edit configuration without opening the file:
 
 ```bash
+playpen config set image rust                # rust, jvm, or custom
+playpen config set harness omp               # omp, pi, opencode, or vibe
+playpen config set image custom              # custom path settings below
+playpen config set containerfile containers/Containerfile
+playpen config set context containers
 playpen config set host_engine true          # enable for this project
 playpen config set host_engine false         # explicitly disable for this project
 playpen config rm host_engine                # remove the project override
@@ -141,10 +185,14 @@ Output describes persistent settings and defaults, not launch overrides:
 
 Precedence, highest first:
 
-1. Explicit `--host-engine` or `--no-host-engine` launch flag (mutually exclusive).
-2. Project `host_engine`, including an explicit `false`.
-3. Global `host_engine`.
-4. Built-in default: `false`.
+1. Explicit IMAGE, `--harness`, or host-engine launch flag.
+2. Project settings, including an explicit `host_engine = false`.
+3. Global defaults (`image`, `harness`, `host_engine`).
+4. Built-in `host_engine = false`; explicit-image launches default to omp
+   when no harness is configured.
+
+One-off launch overrides never change saved settings. Removing required project
+settings makes an image-less launch incomplete again and triggers setup.
 
 Removing a key means **inherit**, not disable: removing a project `false` can
 re-enable access if the global value is `true`. Use `set host_engine false`
@@ -159,20 +207,21 @@ edits target the Git root, or the working directory outside Git. Discovery
 does not change the working directory mounted at `/workspace`.
 
 Missing files mean no overrides; dangling configuration-file symlinks and
-symlink loops are errors, not missing files. Invalid TOML, unknown keys, and
-non-boolean `host_engine` values fail with a file diagnostic, even if a
-higher-priority setting would override them. CLI values must be exactly
-`true` or `false`.
-Configuration commands validate both selected layers before writing.
+symlink loops are errors, not missing files. Invalid TOML, unknown keys/types,
+and invalid image/harness choices fail with a file diagnostic, even if a
+higher-priority setting would override them. `host_engine` CLI values must be
+exactly `true` or `false`. Configuration commands validate the selected layers
+before writing; partial records can be built up with successive `config set`
+commands.
 
 Project configuration is trusted automatically: a cloned or modified file can
 enable host-engine access without approval. The launch warning is informational,
 not an approval prompt. Review project configuration before launching untrusted
 code; a gitignored file can still be modified by code inside the mounted project.
 
-`PLAYPEN_HOST_ENGINE` is no longer read. Replace shell/direnv exports with the
-project or global commands above. Other environment settings and the existing
-keys/harness configuration files are unchanged.
+`PLAYPEN_HOST_ENGINE` and `~/.config/playpen/harness.conf` are not read.
+Migrate `HARNESS=omp` with `playpen config --global set harness omp`, or choose
+a project harness using setup. API keys remain in the separate `keys.conf`.
 
 ## Harnesses
 
@@ -188,8 +237,10 @@ The agent itself is a thin image layer the launcher builds and maintains:
 - A flavor image newer than its harness layer (after `make base` /
   `make rust` / `make jvm`) triggers a rebuild of the layer - so the agent
   environment always matches the toolchain.
-- `playpen harness` picks the default (stored as `HARNESS=` in
-  `~/.config/playpen/harness.conf`); `--harness NAME` overrides per run.
+- `playpen setup` or `playpen config set harness NAME` saves project selection
+  in TOML; `--harness NAME` overrides per run. Use
+  `playpen config --global set harness NAME` for a user-wide default. The old
+  `playpen harness` selection menu is removed; its update subcommand remains.
 - `playpen harness update` rebuilds every installed `playpen*:<harness>`
   image cache-busted: a fresh harness version on an untouched toolchain.
 - `playpen update` does both halves for every installed layer: re-pull the
@@ -370,6 +421,7 @@ changing credentials; a failed workflow leaves the manually published release in
 
 ## Roadmap
 
-The move to project-local interactive setup, local image builds, and binary-only
-releases is planned in [ROADMAP.md](ROADMAP.md). The commands above describe the
-current behavior; setup and registry removal are not implemented yet.
+Project-local interactive setup is implemented. Local image provisioning,
+additional harness installers, and binary-only releases remain planned in
+[ROADMAP.md](ROADMAP.md). The commands above describe current behavior;
+registry removal is not implemented yet.

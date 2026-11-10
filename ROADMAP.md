@@ -18,8 +18,12 @@ This document separates the current implementation from planned behavior.
   host user's numeric UID/GID and a persistent, expendable agent home.
 - `--shell`, explicit `-- CMD`, API keys from `keys.conf`, `op://` resolution,
   signal cleanup, and opt-in host-engine socket access are implemented.
-- Project/global TOML supports `host_engine` only. Harness selection is still
-  stored separately in the global `harness.conf`; only omp is implemented.
+- Project/global TOML supports typed image/harness selection and `host_engine`;
+  custom recipe/context paths are project-only. `playpen setup` configures a
+  project; launches without an explicit image complete missing local settings.
+  Harness selection now lives only in TOML; `harness.conf` is no longer read.
+  Rust/JVM with omp can launch; other choices are saved but report unavailable
+  provisioning until milestone 3.
 - `make` builds base and flavor images locally. The launcher pulls missing
   flavor images from GHCR and builds thin harness layers locally. Tagged or
   foreign images run verbatim rather than receiving a harness layer.
@@ -27,8 +31,8 @@ This document separates the current implementation from planned behavior.
   Docker and Podman on Linux amd64/arm64. Releases still publish images to GHCR
   alongside binary archives, checksums, and the installer.
 
-Interactive project setup, automatic local flavor builds, the additional
-harnesses, and binary-only releases are not implemented yet.
+Automatic local flavor/custom builds, the additional harness installers, and
+binary-only releases are not implemented yet.
 
 ## Target workflow
 
@@ -77,8 +81,8 @@ launch orchestration within the application as those responsibilities grow.
   builds work without a source checkout. Build only the selected flavor and
   harness, sharing cached base layers where appropriate.
 - Replace registry provisioning and pull-based updates with local build/update
-  behavior. Retire `PLAYPEN_REGISTRY` and the separate `harness.conf` selection
-  path when their replacements are complete; do not keep parallel conventions.
+  behavior. Retire `PLAYPEN_REGISTRY` when that replacement is complete; do not
+  keep parallel conventions. Harness selection has already moved solely to TOML.
 - Use project-scoped identities for custom images so unrelated projects cannot
   overwrite each other's environments.
 - Resolve custom recipe paths against the project root. Prefer project-relative
@@ -106,13 +110,22 @@ Acceptance: standard Cargo commands work from the repository root, existing
 checks and launcher smoke scenarios still work, and image/build/package commands
 refer to the relocated resources. No setup or registry cutover belongs here.
 
-### 2. Configuration and setup — planned
+### 2. Configuration and setup — implemented
 
-- Add typed project image/harness settings and custom recipe/context paths.
-- Extend configuration inspection/editing and introduce the first-run wizard.
-- Reuse discovery and atomic writes; detect incomplete files, preserve existing
-  values, and define how users deliberately reconfigure a project.
-- Consolidate persistent harness selection into TOML.
+- Typed `image` (rust/jvm/custom), `harness` (omp/pi/opencode/vibe),
+  `host_engine`, and project-only `containerfile`/`context` paths.
+- `playpen setup` deliberately reconfigures without launching. Image-less
+  launches prompt only for missing local settings; explicit image launches
+  remain one-off overrides and bypass setup.
+- Existing discovery and atomic writes preserve values, comments, permissions,
+  and symlinks. Setup saves complete validated settings before provisioning.
+- Configuration commands inspect/edit the new keys. Global defaults seed setup;
+  custom paths resolve from the discovered project root.
+- Persistent harness selection is consolidated into TOML. The old selection
+  menu and `harness.conf` implementation are removed; migrate with
+  `playpen config --global set harness omp` or project setup.
+- Existing Rust/JVM/omp provisioning remains unchanged. Custom images and new
+  harnesses fail explicitly on launch rather than silently falling back.
 
 Acceptance: choices survive a second invocation; partial files enter setup;
 invalid paths, invalid choices, cancellation, and noninteractive first use have
@@ -168,7 +181,8 @@ package retirement has an explicit old-release policy.
 
 - Exact installation/version policy and executable invocation for each new
   harness, and the supported custom-image prerequisite contract.
-- CLI names for explicit setup/build/update operations and the scope of refreshes.
+- CLI names for explicit build/update operations and the scope of refreshes.
+  Explicit setup is `playpen setup`.
 - Whether launches from a subdirectory mount the resolved project root
   (recommended) instead of the invocation directory (current behavior).
 - Image identity and dependency tracking: prefer engine image IDs/labels over

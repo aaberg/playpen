@@ -15,7 +15,7 @@ use crate::host::Host;
     name = "playpen",
     version,
     about = "Run an AI coding agent inside a sandboxed container",
-    long_about = "Run an AI coding agent (harness omp by default) inside a rootless container.\n\
+    long_about = "Run the project's configured AI coding agent inside a rootless container.\n\
                   The workspace is mounted at /workspace; the agent gets a throwaway\n\
                   home that persists on the host.",
     after_help = "Environment:\n  \
@@ -25,8 +25,9 @@ use crate::host::Host;
         Keys file (override with --keys FILE):\n  \
         ~/.config/playpen/keys.conf - one NAME=value per line; a value is a literal\n  \
         or an op:// reference resolved with the 1Password CLI at launch.\n\n\
-        Harness selection (override with --harness NAME):\n  \
-        ~/.config/playpen/harness.conf - set by `playpen harness`\n\n\
+        Project setup:\n  \
+        playpen setup - configure or reconfigure .playpen/playpen.toml\n  \
+        Running without IMAGE completes missing project settings interactively.\n\n\
         Launch configuration (flags override project, then global settings):\n  \
         .playpen/playpen.toml - nearest project file within Git/home boundary\n  \
         $XDG_CONFIG_HOME/playpen/playpen.toml [fallback: ~/.config/playpen/playpen.toml]\n  \
@@ -42,7 +43,7 @@ use crate::host::Host;
         playpen config set host_engine true     enable access for this project\n  \
         playpen config --global rm host_engine  remove the global override\n  \
         playpen config list                     show effective settings + sources\n  \
-        playpen harness                          pick the default harness\n  \
+        playpen setup                            configure this project\n  \
         playpen harness update                   refresh installed harnesses\n  \
         playpen update                           re-pull flavors + rebuild layers"
 )]
@@ -67,9 +68,9 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub harness: Option<String>,
 
-    /// Container image to run
-    #[arg(value_name = "IMAGE", default_value = "playpen-base")]
-    pub image: String,
+    /// One-off image override (otherwise use project configuration)
+    #[arg(value_name = "IMAGE")]
+    pub image: Option<String>,
 
     /// Command passed verbatim to the container (everything after --)
     #[arg(value_name = "CMD", last = true, num_args = 0..)]
@@ -83,11 +84,13 @@ pub struct Cli {
 /// The launcher's subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Sub {
-    /// Pick the default harness (stored in ~/.config/playpen/harness.conf)
+    /// Configure or reconfigure this project interactively, without launching
+    Setup,
+    /// Maintain installed harness layers
     Harness {
         /// Rebuild installed harness images with fresh harness versions
         #[command(subcommand)]
-        cmd: Option<HarnessSub>,
+        cmd: HarnessSub,
     },
     /// Re-pull flavor images from the registry and rebuild harness layers
     Update,
@@ -113,7 +116,7 @@ pub enum HarnessSub {
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigSub {
-    /// Set a configuration key (host_engine accepts true or false)
+    /// Set image, harness, host_engine, containerfile, or context
     Set { key: String, value: String },
     /// Remove a key from this scope, revealing any inherited value
     Rm { key: String },
@@ -126,8 +129,8 @@ pub enum ConfigSub {
 pub enum Action {
     /// A container run.
     Run(Config),
-    /// `playpen harness`: the selection menu.
-    HarnessMenu,
+    /// `playpen setup`: deliberately reconfigure project settings.
+    Setup,
     /// `playpen harness update [NAME]`.
     HarnessUpdate { name: Option<String> },
     /// `playpen update`: re-pull flavors + rebuild harness layers. The
@@ -147,7 +150,7 @@ pub struct Config {
     /// The `--harness` flag, when given.
     pub harness: Option<String>,
     pub shell: bool,
-    pub image: String,
+    pub image: Option<String>,
     /// Non-empty only with an explicit `-- CMD`.
     pub command: Vec<OsString>,
 }
@@ -214,10 +217,10 @@ fn normalize(argv: &[OsString]) -> Result<Vec<OsString>, &'static str> {
 
 fn resolve(cli: Cli, host: &Host) -> Action {
     match cli.sub {
+        Some(Sub::Setup) => return Action::Setup,
         Some(Sub::Harness { cmd }) => {
             return match cmd {
-                None => Action::HarnessMenu,
-                Some(HarnessSub::Update { name }) => Action::HarnessUpdate { name },
+                HarnessSub::Update { name } => Action::HarnessUpdate { name },
             };
         }
         Some(Sub::Update) => {
@@ -389,7 +392,7 @@ mod tests {
             keys: None,
             shell,
             harness: None,
-            image: image.to_string(),
+            image: Some(image.to_string()),
             command,
             sub: None,
         }
@@ -398,14 +401,14 @@ mod tests {
     #[test]
     fn subcommands_beat_the_image_positional() {
         let c = Cli {
-            sub: Some(Sub::Harness { cmd: None }),
+            sub: Some(Sub::Setup),
             ..cli(false, "playpen-base", vec![])
         };
-        assert!(matches!(resolve(c, &host()), Action::HarnessMenu));
+        assert!(matches!(resolve(c, &host()), Action::Setup));
 
         let c = Cli {
             sub: Some(Sub::Harness {
-                cmd: Some(HarnessSub::Update { name: None }),
+                cmd: HarnessSub::Update { name: None },
             }),
             ..cli(false, "playpen-base", vec![])
         };
@@ -413,9 +416,9 @@ mod tests {
 
         let c = Cli {
             sub: Some(Sub::Harness {
-                cmd: Some(HarnessSub::Update {
+                cmd: HarnessSub::Update {
                     name: Some("omp".to_string()),
-                }),
+                },
             }),
             ..cli(false, "playpen-base", vec![])
         };
@@ -456,7 +459,7 @@ mod tests {
             panic!("expected run");
         };
         assert!(cfg.shell);
-        assert_eq!(cfg.image, "playpen-jvm");
+        assert_eq!(cfg.image.as_deref(), Some("playpen-jvm"));
         assert!(cfg.command.is_empty(), "no explicit command");
 
         let c = cli(false, "playpen-jvm", vec!["omp".into(), "--version".into()]);

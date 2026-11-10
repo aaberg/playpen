@@ -10,6 +10,7 @@ mod harness;
 mod host;
 mod images;
 mod keys;
+mod setup;
 mod signals;
 
 use std::ffi::OsString;
@@ -23,7 +24,13 @@ use crate::host::Host;
 fn main() -> ExitCode {
     let host = Host::from_env();
     match cli::parse(&host) {
-        Action::HarnessMenu => harness::menu(&host),
+        Action::Setup => match setup::run(&host, true) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("playpen: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Action::HarnessUpdate { name } => {
             images::update(&host, engine::select(&host), name.as_deref())
         }
@@ -57,6 +64,43 @@ fn main() -> ExitCode {
 }
 
 fn run(host: &Host, config: Config) -> ExitCode {
+    if config.image.is_none() {
+        let ready = match config::project_ready(host) {
+            Ok(ready) => ready,
+            Err(err) => {
+                eprintln!("playpen: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if !ready {
+            if let Err(err) = setup::run(host, false) {
+                eprintln!("playpen: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let selection = match config::selection(host) {
+        Ok(selection) => selection,
+        Err(err) => {
+            eprintln!("playpen: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let image = match config.image.as_deref() {
+        Some(image) => image,
+        None => match selection.image {
+            Some(config::Image::Rust) => "playpen-rust",
+            Some(config::Image::Jvm) => "playpen-jvm",
+            Some(config::Image::Custom) => {
+                eprintln!(
+                    "playpen: custom image provisioning is not implemented until milestone 3; \
+                     settings are saved; use an explicit IMAGE to run an existing image"
+                );
+                return ExitCode::FAILURE;
+            }
+            None => unreachable!("setup saves a complete project selection"),
+        },
+    };
     let settings = match config::resolve(host, config.host_engine) {
         Ok(settings) => settings,
         Err(err) => {
@@ -64,9 +108,14 @@ fn run(host: &Host, config: Config) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let harness = harness::resolve(
+        config
+            .harness
+            .as_deref()
+            .or(selection.harness.as_ref().map(|choice| choice.as_str())),
+    );
     let engine = engine::select(host);
-    let harness = harness::resolve(host, config.harness.as_deref());
-    let plan = images::plan(&config.image, harness.name);
+    let plan = images::plan(image, harness.name);
 
     // Fail fast on a missing host-engine socket, before any build work;
     // the boundary warning also precedes the (streamed) build output.
@@ -77,7 +126,7 @@ fn run(host: &Host, config: Config) -> ExitCode {
             images::ensure(engine, &flavor, &target, harness, images::registry(host));
             target
         }
-        images::Plan::Verbatim => config.image.clone(),
+        images::Plan::Verbatim => image.to_owned(),
     };
 
     // A failed build must not waste an `op read` prompt: keys resolve last.
@@ -93,7 +142,7 @@ fn run(host: &Host, config: Config) -> ExitCode {
         container_name: format!("playpen-agent-{}", host.pid),
         workspace: host.workspace.as_path(),
         agent_home: agent_home.as_path(),
-        cargo_volume: config.image.starts_with("playpen-rust"),
+        cargo_volume: image.starts_with("playpen-rust"),
         engine_args,
         env_file: env_file.as_ref().map(|f| f.path()),
         image: &image,
@@ -162,7 +211,7 @@ mod tests {
             keys_explicit: false,
             harness: None,
             shell,
-            image: String::from("playpen-base"),
+            image: Some(String::from("playpen-base")),
             command: command.iter().map(OsString::from).collect(),
         }
     }
